@@ -1,6 +1,6 @@
-import { useEffect, useRef, useState } from 'react'
-import { binderColumns, binderPageSize, binderPagesPerSpread, binderRows, binderSpreadSize, defaultFilters } from './binder'
-import type { CatalogFilters, CatalogRequest, OwnedFinish, PrintingDetails, View } from './binder'
+import { Fragment, useEffect, useRef, useState } from 'react'
+import { binderColumns, binderPageSize, binderPagesPerSpread, binderRows, binderSpreadSize, defaultBinderFilters, defaultFilters, legalityFormatNames } from './binder'
+import type { BinderFilters, CatalogFilters, CatalogRequest, OwnedFinish, PrintingDetails, SelectionTarget, View } from './binder'
 import { BinderCover, Settings } from './Settings'
 import { readPreferences, savePreferences } from './preferences'
 import type { Preferences } from './preferences'
@@ -15,11 +15,15 @@ type Printing = {
   language: string
   image_uris: string | null
   ownedFinish?: OwnedFinish
+  collectionId?: number
+  ownedSlot?: number
+  tags?: string[]
 }
 
 type WorkerResponse =
   | { type: 'results'; rows: Pocket[]; page: number; hasMore: boolean; updatedAt: string | null;
-      view: View; languages: string[]; edited: boolean; lastSlot: number; reservedSpreads: number }
+      view: View; languages: string[]; edited: boolean; lastSlot: number; reservedSpreads: number;
+      matchCount: number | null; binderMetadataReady: boolean; binderTags: string[] }
   | { type: 'sync'; message: string }
   | { type: 'details'; scryfallId: string; details: PrintingDetails }
   | { type: 'error'; operation: CatalogRequest['type']; message: string; scryfallId?: string }
@@ -48,6 +52,34 @@ function cardImages(card: Printing, fullSize = false): string[] {
 }
 
 const finishLabels: Record<OwnedFinish, string> = { nonfoil: 'Nonfoil', foil: 'Foil', unspecified: 'Unspecified' }
+const legalityLabels: Record<string, string> = {
+  legal: 'Legal', restricted: 'Restricted', banned: 'Banned', not_legal: 'Not legal',
+}
+
+function CardLegalities({ details }: { details: PrintingDetails }) {
+  const groups = new Map<string, string[]>()
+  for (const [format, status] of Object.entries(details.legalities)) {
+    const name = legalityFormatNames[format] ?? format.replaceAll('_', ' ')
+    const names = groups.get(status) ?? []
+    groups.set(status, [...names, name])
+  }
+  const statuses = [...new Set([...Object.keys(legalityLabels), ...groups.keys()])]
+
+  return (
+    <>
+      <h3>Format legalities</h3>
+      {groups.size > 0 ? <dl>
+        {statuses.filter((status) => groups.has(status)).map((status) => (
+          <Fragment key={status}>
+            <dt>{legalityLabels[status] ?? status.replaceAll('_', ' ')}</dt>
+            <dd>{groups.get(status)?.sort((a, b) => a.localeCompare(b)).join(', ')}</dd>
+          </Fragment>
+        ))}
+      </dl> : <p>No legality data available.</p>}
+      {!details.legalitiesComplete && <p>Update Full Catalog to see all legality statuses.</p>}
+    </>
+  )
+}
 
 function CardPreview({ preview, onClose, onAdd }: {
   preview: Preview
@@ -86,9 +118,9 @@ function CardPreview({ preview, onClose, onAdd }: {
             <dt>Set</dt><dd>{details?.setName ?? card.set_code.toUpperCase()}</dd>
             <dt>Collector number</dt><dd>{card.collector_number}</dd>
             <dt>Language</dt><dd>{languageLabels[card.language] ?? languageNames.of(card.language) ?? card.language}</dd>
-            {details && <><dt>Legal formats</dt><dd>{details.formats.join(', ') || 'None listed'}</dd></>}
           </dl>
           {details && <>
+            <CardLegalities details={details} />
             <p><strong>You own {details.owned} {details.owned === 1 ? 'copy' : 'copies'} of this printing.</strong></p>
             <p>{details.ownedNonfoil} nonfoil · {details.ownedFoil} foil</p>
             <label className="preview-finish">Finish to add <select value={selectedFinish}
@@ -109,11 +141,12 @@ function CardPreview({ preview, onClose, onAdd }: {
   )
 }
 
-function BinderSheet({ cards, onPocket, selectedPocket, allowEmpty, disabled, pageNumber,
+function BinderSheet({ cards, onPocket, selectedPocket, multiSelected, allowEmpty, disabled, pageNumber,
   rows = binderRows, columns = binderColumns }: {
   cards: Pocket[]
   onPocket?: (index: number, card: Pocket) => void
   selectedPocket?: number
+  multiSelected?: (index: number) => boolean
   allowEmpty?: boolean
   disabled?: boolean
   pageNumber?: number
@@ -130,17 +163,19 @@ function BinderSheet({ cards, onPocket, selectedPocket, allowEmpty, disabled, pa
             const card = cards[index] ?? null
             const image = card ? cardImages(card)[0] : undefined
             const isFoil = card?.ownedFinish === 'foil'
+            const tags = card?.tags?.join(', ')
             const printing = card?.set_code
               ? `${card.set_code.toUpperCase()} #${card.collector_number} · ${card.language.toUpperCase()}` : ''
             return (
-              <figure className="card-pocket" key={column} title={card ? `${card.name} · ${printing}` : undefined}>
+              <figure className="card-pocket" key={column} title={card ? `${card.name} · ${printing}${tags ? ` · Tags: ${tags}` : ''}` : undefined}>
                 {card && <figcaption><strong>{card.name}</strong><small>{printing}</small></figcaption>}
                 {image && <img key={image} src={image} alt="" loading="lazy" crossOrigin="anonymous"
                   onError={(event) => { event.currentTarget.hidden = true }} />}
                 {isFoil && <span className="foil-badge">Foil</span>}
+                {tags && <span className="pocket-tags" aria-hidden="true">{tags}</span>}
                 {onPocket && (card || allowEmpty) && <button type="button" className="pocket-control" disabled={disabled}
-                  aria-label={card ? `${card.name} ${printing}${isFoil ? ', foil' : ''}, pocket ${index + 1}` : `Empty pocket ${index + 1}`}
-                  aria-pressed={selectedPocket === index ? true : undefined}
+                  aria-label={card ? `${card.name} ${printing}${isFoil ? ', foil' : ''}, pocket ${index + 1}${tags ? `, tags: ${tags}` : ''}` : `Empty pocket ${index + 1}`}
+                  aria-pressed={multiSelected ? multiSelected(index) : selectedPocket === index || undefined}
                   onClick={() => onPocket(index, card)}>
                   {!card && <span aria-hidden="true">+</span>}
                 </button>}
@@ -165,11 +200,18 @@ function App() {
   const [error, setError] = useState('')
   const [view, setView] = useState<View>('catalog')
   const [filters, setFilters] = useState(defaultFilters)
+  const [binderFilterDraft, setBinderFilterDraft] = useState(defaultBinderFilters)
+  const [binderTags, setBinderTags] = useState<string[]>([])
+  const [matchCount, setMatchCount] = useState<number | null>(null)
+  const [binderMetadataReady, setBinderMetadataReady] = useState(false)
   const [languages, setLanguages] = useState<string[]>([])
   const [selection, setSelection] = useState<Selection | null>(null)
+  const [selectedCards, setSelectedCards] = useState<SelectionTarget[] | null>(null)
+  const [tagName, setTagName] = useState('')
   const [preview, setPreview] = useState<Preview | null>(null)
   const [preferences, setPreferences] = useState(readPreferences)
   const initialPageSize = useRef(preferences.rows * preferences.columns)
+  const initialBinderSorting = useRef(preferences.binderSorting)
   const [settingsOpen, setSettingsOpen] = useState(false)
   const [cover, setCover] = useState<'front' | 'back' | null>(null)
   const [lastSlot, setLastSlot] = useState(-1)
@@ -196,8 +238,14 @@ function App() {
         setLanguages(data.languages)
         setLastSlot(data.lastSlot)
         setReservedSpreads(data.reservedSpreads)
-        if (data.edited) setSelection(null)
+        if (data.edited) {
+          setSelection(null)
+          setSelectedCards(null)
+        }
         setHasMore(data.hasMore)
+        setMatchCount(data.matchCount)
+        setBinderMetadataReady(data.binderMetadataReady)
+        setBinderTags(data.binderTags)
         setPage(data.page)
         setUpdatedAt(data.updatedAt)
         setBusy(false)
@@ -224,7 +272,7 @@ function App() {
       setBusy(false)
       setSyncStatus('')
     }
-    worker.postMessage({ type: 'load', pageSize: initialPageSize.current })
+    worker.postMessage({ type: 'load', pageSize: initialPageSize.current, binderSorting: initialBinderSorting.current })
     function checkForUpdates() {
       if (navigator.onLine) worker.postMessage({ type: 'sync' })
     }
@@ -253,12 +301,14 @@ function App() {
   const pageSize = view === 'binder' ? rows * columns : binderPageSize
   const spreadSize = view === 'binder' ? pageSize * binderPagesPerSpread : binderSpreadSize
   const spreadCount = Math.max(preferences.spreads, reservedSpreads, Math.floor(lastSlot / spreadSize) + 1)
-  const canGoPrevious = view === 'binder' ? cover !== 'front' : page > 0
-  const canGoNext = view === 'binder' ? cover !== 'back' : hasMore
+  const filteredBinder = view === 'binder' && matchCount !== null
+  const customBinder = view === 'binder' && !filteredBinder
+  const canGoPrevious = customBinder ? cover !== 'front' : page > 0
+  const canGoNext = customBinder ? cover !== 'back' : hasMore
 
   function turnPage(direction: 'next' | 'previous') {
     if (busy || turn || (direction === 'next' ? !canGoNext : !canGoPrevious)) return
-    if (view === 'binder') {
+    if (customBinder) {
       if (cover) {
         setCover(null)
         return
@@ -282,7 +332,24 @@ function App() {
     if (busy || view === nextView) return
     setCover(null)
     setSelection(null)
+    setSelectedCards(null)
+    setBinderFilterDraft(defaultBinderFilters)
     requestPrintings({ type: 'view', view: nextView })
+  }
+
+  function applyBinderFilters(filters: BinderFilters) {
+    setCover(null)
+    setTurn(null)
+    setSelectedCards(null)
+    requestPrintings({ type: 'filter-binder', filters: {
+      name: filters.name.trim(),
+      typeLine: filters.typeLine.trim(),
+      color: filters.color,
+      manaCost: filters.manaCost.trim(),
+      sets: filters.sets.split(',').map((set) => set.trim()).filter(Boolean).join(','),
+      tag: filters.tag,
+      tagOrder: filters.tagOrder,
+    } })
   }
 
   function applySettings(next: Preferences) {
@@ -293,7 +360,11 @@ function App() {
     if (layoutChanged) {
       setCover(null)
       setSelection(null)
-      requestPrintings({ type: 'layout', pageSize: next.rows * next.columns })
+      setSelectedCards(null)
+    }
+    if (layoutChanged || next.binderSorting !== preferences.binderSorting) {
+      requestPrintings({ type: 'layout', pageSize: layoutChanged ? next.rows * next.columns : undefined,
+        binderSorting: next.binderSorting })
     }
   }
 
@@ -310,12 +381,28 @@ function App() {
     requestPrintings({ type: 'page', page: spreadCount })
   }
 
+  function openPrintingPreview(card: Printing) {
+    const worker = workerRef.current
+    if (!worker) return
+    setPreview({ card })
+    const request: CatalogRequest = { type: 'details', scryfallId: card.scryfall_id }
+    worker.postMessage(request)
+  }
+
   function choosePocket(slot: number, card: Pocket) {
-    if (view === 'catalog') {
-      if (!card || !workerRef.current) return
-      setPreview({ card })
-      const request: CatalogRequest = { type: 'details', scryfallId: card.scryfall_id }
-      workerRef.current.postMessage(request)
+    if (view === 'catalog' || (filteredBinder && selectedCards === null)) {
+      if (card) openPrintingPreview(card)
+      return
+    }
+    if (selectedCards !== null) {
+      const collectionId = card?.collectionId
+      if (collectionId === undefined) return
+      setSelectedCards((current) => {
+        if (current === null) return current
+        return current.some((target) => target.slot === slot)
+          ? current.filter((target) => target.slot !== slot)
+          : [...current, { slot, collectionId }]
+      })
       return
     }
     if (!selection) {
@@ -329,6 +416,19 @@ function App() {
     requestPrintings(selection.from === undefined
       ? { type: 'place', scryfallId: selection.card.scryfall_id, slot, finish: selection.finish }
       : { type: 'move', from: selection.from, slot })
+  }
+
+  function removeSelectedCard() {
+    if (selection?.from === undefined || selection.card.collectionId === undefined) return
+    if (!window.confirm(`Remove ${selection.card.name} from the binder?`)) return
+    requestPrintings({ type: 'remove', targets: [{ slot: selection.from, collectionId: selection.card.collectionId }] })
+  }
+
+  function removeSelectedCards() {
+    if (!selectedCards?.length) return
+    const count = selectedCards.length
+    if (!window.confirm(`Remove ${count} selected ${count === 1 ? 'card' : 'cards'} from the binder?`)) return
+    requestPrintings({ type: 'remove', targets: selectedCards })
   }
 
   return (
@@ -376,8 +476,17 @@ function App() {
           </details>
           <label>Set <input form="catalog-search" placeholder="Name or code" value={filters.set}
             onChange={(event) => setFilters({ ...filters, set: event.target.value })} /></label>
-          <label>Format <input form="catalog-search" placeholder="e.g. modern" value={filters.format}
-            onChange={(event) => setFilters({ ...filters, format: event.target.value })} /></label>
+          <button type="button" disabled={busy} onClick={() => {
+            const next = { ...filters, set: 'Secret Lair' }
+            setFilters(next)
+            requestPrintings({ type: 'search', filters: next })
+          }}>Secret Lair Printings</button>
+          <label>Playable in <select value={filters.legalIn}
+            onChange={(event) => setFilters({ ...filters, legalIn: event.target.value })}>
+            <option value="">Any format</option>
+            {Object.entries(legalityFormatNames).map(([format, name]) =>
+              <option key={format} value={format}>{name}</option>)}
+          </select></label>
           <label>Finish <select value={filters.finish} onChange={(event) => {
             setFilters({ ...filters, finish: event.target.value as CatalogFilters['finish'] })
           }}>
@@ -398,6 +507,52 @@ function App() {
             requestPrintings({ type: 'search', filters: defaultFilters })
           }}>Clear</button>
         </div>}
+        {view === 'binder' && <form className="catalog-filters" aria-label="Binder filters" onSubmit={(event) => {
+          event.preventDefault()
+          applyBinderFilters(binderFilterDraft)
+        }}>
+          <label>Name <input type="search" value={binderFilterDraft.name}
+            onChange={(event) => setBinderFilterDraft({ ...binderFilterDraft, name: event.target.value })} /></label>
+          <label>Card type <input placeholder="e.g. Creature" value={binderFilterDraft.typeLine}
+            onChange={(event) => setBinderFilterDraft({ ...binderFilterDraft, typeLine: event.target.value })} /></label>
+          <label>Mana color <select value={binderFilterDraft.color}
+            onChange={(event) => setBinderFilterDraft({ ...binderFilterDraft, color: event.target.value })}>
+            <option value="">Any color</option>
+            <option value="W">White</option>
+            <option value="U">Blue</option>
+            <option value="B">Black</option>
+            <option value="R">Red</option>
+            <option value="G">Green</option>
+            <option value="colorless">Colorless</option>
+          </select></label>
+          <label>Mana cost <input placeholder="e.g. {2}{U} or 3" value={binderFilterDraft.manaCost}
+            onChange={(event) => setBinderFilterDraft({ ...binderFilterDraft, manaCost: event.target.value })} /></label>
+          <label>Sets <input placeholder="Names or codes" maxLength={250} value={binderFilterDraft.sets}
+            aria-describedby="binder-set-hint"
+            onChange={(event) => setBinderFilterDraft({ ...binderFilterDraft, sets: event.target.value })} /></label>
+          <span id="binder-set-hint">Separate sets with commas.</span>
+          <label>Tag <select value={binderFilterDraft.tag}
+            onChange={(event) => setBinderFilterDraft({ ...binderFilterDraft, tag: event.target.value })}>
+            <option value="">Any tag</option>
+            {binderFilterDraft.tag && !binderTags.includes(binderFilterDraft.tag) &&
+              <option value={binderFilterDraft.tag}>{binderFilterDraft.tag}</option>}
+            {binderTags.map((tag) => <option key={tag} value={tag}>{tag}</option>)}
+          </select></label>
+          <label>Sort by <select value={binderFilterDraft.tagOrder} onChange={(event) => {
+            const tagOrder = event.target.value as BinderFilters['tagOrder']
+            setBinderFilterDraft({ ...binderFilterDraft, tagOrder })
+          }}>
+            <option value="">Pocket order</option>
+            <option value="asc">Tag (A–Z)</option>
+            <option value="desc">Tag (Z–A)</option>
+            <option value="priorities">Settings priorities</option>
+          </select></label>
+          <button type="submit" disabled={busy || Boolean(selection)}>Apply Filters</button>
+          <button type="button" disabled={busy || Boolean(selection)} onClick={() => {
+            setBinderFilterDraft(defaultBinderFilters)
+            applyBinderFilters(defaultBinderFilters)
+          }}>Custom Layout</button>
+        </form>}
         <div className="catalog-status">
           {syncStatus && <p role="status">{syncStatus}</p>}
           {syncError && <p role="alert">Catalog update failed. {syncError}</p>}
@@ -406,27 +561,63 @@ function App() {
             <p>Connect to the internet to download the full card catalog.</p>
           )}
           {error && <p role="alert">{error}</p>}
+          {view === 'binder' && !binderMetadataReady && !syncStatus &&
+            <p>Use Update Full Catalog to load card type, color, and mana cost data.</p>}
           <p role="status">
             {busy ? 'Loading…' : view === 'catalog'
               ? (cards.length ? 'Select a card to view its details.' : 'No matching printings.')
-              : 'Select a card to move it, then choose a destination pocket.'}
+              : filteredBinder ? (matchCount ? `${matchCount} matching ${matchCount === 1 ? 'card' : 'cards'}` : 'No matching binder cards.')
+              : selectedCards ? 'Select cards on any binder page.' : 'Select a card to move it, or use Select Cards for multiple cards.'}
           </p>
         </div>
         {view === 'binder' && selection && <div className="binder-selection">
           <p role="status">{selection.from === undefined ? 'Choose an empty pocket for' : 'Choose a pocket to move or swap'} <strong>{selection.card.name}</strong>{(selection.finish ?? selection.card.ownedFinish) === 'foil' ? ' (foil)' : ''}.</p>
+          {selection.from === undefined && <span>{selection.card.set_code.toUpperCase()} #{selection.card.collector_number}</span>}
           <button type="button" disabled={busy || Boolean(turn)} onClick={addSpread}>Add Pages</button>
+          {selection.from !== undefined && !cover && Math.floor(selection.from / spreadSize) === page &&
+            <>
+              <button type="button" disabled={busy || Boolean(turn)} onClick={() => openPrintingPreview(selection.card)}>Card Details</button>
+              <button type="button" disabled={busy || Boolean(turn)} onClick={() => {
+                if (selection.card.collectionId === undefined) return
+                setTagName('')
+                setSelectedCards([{ slot: selection.from, collectionId: selection.card.collectionId }])
+                setSelection(null)
+              }}>Tag Card</button>
+              <button type="button" disabled={busy || Boolean(turn)} onClick={removeSelectedCard}>Remove Card</button>
+            </>}
           <button type="button" disabled={busy} onClick={() => setSelection(null)}>Cancel</button>
         </div>}
+        {view === 'binder' && selectedCards && <form className="binder-selection" onSubmit={(event) => {
+          event.preventDefault()
+          if (turn || !selectedCards.length || !tagName.trim()) return
+          requestPrintings({ type: 'tag', targets: selectedCards, tag: tagName.trim() })
+        }}>
+          <p role="status">{selectedCards.length} selected</p>
+          <label>Tag <input value={tagName} maxLength={40} disabled={busy}
+            onChange={(event) => setTagName(event.target.value)} /></label>
+          <button type="submit" disabled={busy || Boolean(turn) || !selectedCards.length || !tagName.trim()}>Add Tag</button>
+          <button type="button" disabled={busy || Boolean(turn) || !selectedCards.length}
+            onClick={removeSelectedCards}>Remove Selected</button>
+          <button type="button" disabled={busy} onClick={() => setSelectedCards(null)}>Cancel</button>
+        </form>}
         <nav className="page-controls" aria-label="Binder pages">
           <button type="button" disabled={busy || Boolean(turn) || !canGoPrevious} onClick={() => turnPage('previous')}>
             <span aria-hidden="true">← </span>Previous
           </button>
           <span aria-live="polite">{cover === 'front' ? 'Front cover' : cover === 'back' ? 'Back cover'
+            : filteredBinder ? `Results ${matchCount ? page * spreadSize + 1 : 0}–${Math.min((page + 1) * spreadSize, matchCount ?? 0)}`
             : `Pages ${page * binderPagesPerSpread + 1}–${(page + 1) * binderPagesPerSpread}`}</span>
           <button type="button" disabled={busy || Boolean(turn) || !canGoNext} onClick={() => turnPage('next')}>
             Next<span aria-hidden="true"> →</span>
           </button>
-          {view === 'binder' && !selection && <button type="button" disabled={busy || Boolean(turn)} onClick={addSpread}>Add Spread</button>}
+          {view === 'binder' && !selection && !selectedCards && <>
+            {customBinder && <button type="button" disabled={busy || Boolean(turn)} onClick={addSpread}>Add Spread</button>}
+            <button type="button" disabled={busy || Boolean(turn) || Boolean(cover) || (filteredBinder && matchCount === 0)}
+              onClick={() => {
+                setTagName('')
+                setSelectedCards([])
+              }}>Select Cards</button>
+          </>}
         </nav>
         <div className="binder-viewport" aria-label={view === 'binder' ? 'Personal binder' : 'Card catalog'} role="region" tabIndex={0}
           onKeyDown={(event) => {
@@ -442,7 +633,9 @@ function App() {
               <BinderSheet key={side} cards={sheetCards(cards, side, pageSize)} rows={rows} columns={columns} disabled={busy || Boolean(turn)}
                 pageNumber={page * binderPagesPerSpread + side + 1} allowEmpty={view === 'binder' && Boolean(selection)}
                 selectedPocket={selection?.from === undefined ? undefined : selection.from - page * spreadSize - side * pageSize}
-                onPocket={(index, card) => choosePocket(page * spreadSize + side * pageSize + index, card)} />
+                multiSelected={selectedCards ? (index) => selectedCards.some((target) =>
+                  target.collectionId === cards[side * pageSize + index]?.collectionId) : undefined}
+                onPocket={(index, card) => choosePocket(card?.ownedSlot ?? page * spreadSize + side * pageSize + index, card)} />
             ))}
             {turn && (
               <>
@@ -468,6 +661,7 @@ function App() {
       {preview && <CardPreview key={preview.card.scryfall_id} preview={preview} onClose={() => setPreview(null)}
         onAdd={(finish) => {
           setSelection({ card: preview.card, finish })
+          setBinderFilterDraft(defaultBinderFilters)
           setPreview(null)
           requestPrintings({ type: 'view', view: 'binder' })
         }} />}

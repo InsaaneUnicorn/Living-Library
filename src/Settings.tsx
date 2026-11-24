@@ -2,6 +2,10 @@ import { useEffect, useRef, useState } from 'react'
 import { imageFileTypes, importImage } from './importImage'
 import { defaultPreferences } from './preferences'
 import type { CoverSide, ImportedImage, Preferences } from './preferences'
+import { binderSortFields } from './binder'
+import type { BinderSortRule } from './binder'
+
+const sortFields = Object.keys(binderSortFields) as BinderSortRule['field'][]
 
 const positions = [
   'Top left', 'Top center', 'Top right',
@@ -39,6 +43,8 @@ export function Settings({ preferences, onSave, onClose }: {
   const [side, setSide] = useState<CoverSide>('front')
   const [position, setPosition] = useState(0)
   const [error, setError] = useState('')
+  const { rules, prioritizedTags } = draft.binderSorting
+  const unusedSortFields = sortFields.filter((field) => !rules.some((rule) => rule.field === field))
 
   useEffect(() => { dialog.current?.showModal() }, [])
 
@@ -66,6 +72,17 @@ export function Settings({ preferences, onSave, onClose }: {
     ] })
     setText('')
     setStickerImage(null)
+  }
+
+  function setSortRules(next: BinderSortRule[]) {
+    setDraft({ ...draft, binderSorting: { ...draft.binderSorting, rules: next } })
+  }
+
+  function moveSortRule(index: number, offset: number) {
+    const next = [...rules]
+    const [rule] = next.splice(index, 1)
+    next.splice(index + offset, 0, rule)
+    setSortRules(next)
   }
 
   return (
@@ -107,6 +124,41 @@ export function Settings({ preferences, onSave, onClose }: {
           </select></label>
           <label>Front cover title <input value={draft.coverTitle} maxLength={40} onChange={(event) =>
             setDraft({ ...draft, coverTitle: event.target.value })} /></label>
+        </fieldset>
+        <fieldset>
+          <legend>Binder sorting</legend>
+          <ol className="sort-priority-list">
+            {rules.map((rule, index) => (
+              <li key={rule.field}>
+                <label>Field <select value={rule.field} onChange={(event) => {
+                  const field = event.target.value as BinderSortRule['field']
+                  setSortRules(rules.map((item, position) => position === index ? { ...item, field } : item))
+                }}>
+                  {sortFields.filter((field) => field === rule.field || unusedSortFields.includes(field)).map((field) =>
+                    <option key={field} value={field}>{binderSortFields[field]}</option>)}
+                </select></label>
+                <label>Order <select value={rule.direction} onChange={(event) => {
+                  const direction = event.target.value as BinderSortRule['direction']
+                  setSortRules(rules.map((item, position) => position === index ? { ...item, direction } : item))
+                }}>
+                  <option value="asc">Ascending</option>
+                  <option value="desc">Descending</option>
+                </select></label>
+                <button type="button" title="Raise priority" aria-label={`Raise ${binderSortFields[rule.field]} priority`}
+                  disabled={index === 0} onClick={() => moveSortRule(index, -1)}>↑</button>
+                <button type="button" title="Lower priority" aria-label={`Lower ${binderSortFields[rule.field]} priority`}
+                  disabled={index === rules.length - 1} onClick={() => moveSortRule(index, 1)}>↓</button>
+                <button type="button" aria-label={`Remove ${binderSortFields[rule.field]} sort rule`}
+                  disabled={rules.length === 1} onClick={() => setSortRules(rules.filter((_, position) => position !== index))}>Remove</button>
+              </li>
+            ))}
+          </ol>
+          <button type="button" disabled={!unusedSortFields.length}
+            onClick={() => setSortRules([...rules, { field: unusedSortFields[0], direction: 'asc' }])}>Add Sort Rule</button>
+          <label className="settings-image">Priority tags, highest first, one per line
+            <textarea rows={3} value={prioritizedTags} onChange={(event) =>
+              setDraft({ ...draft, binderSorting: { ...draft.binderSorting, prioritizedTags: event.target.value } })} />
+          </label>
         </fieldset>
         <fieldset>
           <legend>Cover images</legend>

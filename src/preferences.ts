@@ -1,3 +1,6 @@
+import { defaultBinderSorting } from './binder'
+import type { BinderSorting } from './binder'
+
 export type CoverSide = 'front' | 'back'
 export type ImportedImage = { src: string; name: string }
 type Sticker = { id: string; text: string; position: number; side: CoverSide; image?: ImportedImage }
@@ -12,11 +15,13 @@ export type Preferences = {
   coverImages: Partial<Record<CoverSide, ImportedImage>>
   stickers: Sticker[]
   spreads: number
+  binderSorting: BinderSorting
 }
 
 export const defaultPreferences: Preferences = {
   rows: 3, columns: 3, siteTheme: 'dark', binderTheme: 'slate', binding: 'stitched',
   coverTitle: 'My Binder', coverImages: {}, stickers: [], spreads: 1,
+  binderSorting: defaultBinderSorting,
 }
 
 const storageKey = 'living-library-preferences'
@@ -32,5 +37,4 @@ export function readPreferences(): Preferences {
 export function savePreferences(preferences: Preferences) {
   localStorage.setItem(storageKey, JSON.stringify(preferences))
 }
-
 
