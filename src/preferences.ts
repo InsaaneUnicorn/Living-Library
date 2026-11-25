@@ -1,4 +1,4 @@
-import { defaultBinderSorting } from './binder'
+import { defaultBinderId, defaultBinderSorting } from './binder'
 import type { BinderSorting } from './binder'
 
 export type CoverSide = 'front' | 'back'
@@ -25,16 +25,46 @@ export const defaultPreferences: Preferences = {
 }
 
 const storageKey = 'living-library-preferences'
-export function readPreferences(): Preferences {
+const activeBinderKey = 'living-library-active-binder'
+
+export function readActiveBinder(): string {
   try {
-    const saved = localStorage.getItem(storageKey)
+    return localStorage.getItem(activeBinderKey) || defaultBinderId
+  } catch {
+    return defaultBinderId
+  }
+}
+
+export function saveActiveBinder(id: string) {
+  try {
+    localStorage.setItem(activeBinderKey, id)
+  } catch {
+    // The binder is still saved in SQLite. Only the startup selection is lost.
+  }
+}
+
+function preferencesKey(id: string) {
+  return id === defaultBinderId ? storageKey : `${storageKey}:${id}`
+}
+
+export function readPreferences(id = defaultBinderId): Preferences {
+  try {
+    const saved = localStorage.getItem(preferencesKey(id))
     return saved ? { ...defaultPreferences, ...JSON.parse(saved) } : defaultPreferences
   } catch {
     return defaultPreferences
   }
 }
 
-export function savePreferences(preferences: Preferences) {
-  localStorage.setItem(storageKey, JSON.stringify(preferences))
+export function savePreferences(preferences: Preferences, id = defaultBinderId) {
+  localStorage.setItem(preferencesKey(id), JSON.stringify(preferences))
+}
+
+export function removeImportedPreferences(id: string) {
+  try {
+    localStorage.removeItem(preferencesKey(id))
+  } catch {
+    // A failed import's unused settings do not affect any saved binder.
+  }
 }
 

@@ -1,7 +1,8 @@
 import sqlite3InitModule from '@sqlite.org/sqlite-wasm'
 import type { Database } from '@sqlite.org/sqlite-wasm'
-import { binderSpreadSize, defaultBinderSorting, defaultFilters } from './binder'
+import { binderSpreadSize, defaultBinderId, defaultBinderSorting, defaultFilters } from './binder'
 import type { BinderFilters, BinderSortRule, CatalogRequest, OwnedFinish, PrintingDetails, View } from './binder'
+import type { BinderFile, BinderFileCard } from './binderTransfer'
 
 type ImageUris = Record<string, string>
 
@@ -36,10 +37,12 @@ const printingColumns = `
 let database: ReturnType<typeof openCatalog> | undefined
 let view: View = 'catalog'
 let filters = defaultFilters
+let catalogMatchCount: number | undefined
 let activePage = 0
 let customBinderPage = 0
 let binderFilters: BinderFilters | null = null
 let binderSorting = defaultBinderSorting
+let activeBinderId = defaultBinderId
 let binderMetadataReady = false
 let legalitiesReady = false
 let binderSpreadCapacity = binderSpreadSize
@@ -53,6 +56,11 @@ async function openCatalog() {
   try {
     collection.exec(`
       PRAGMA foreign_keys = ON;
+      CREATE TABLE IF NOT EXISTS saved_binders (
+        id TEXT PRIMARY KEY NOT NULL,
+        name TEXT NOT NULL
+      );
+      INSERT OR IGNORE INTO saved_binders (id, name) VALUES ('main', 'My Binder');
       CREATE TABLE IF NOT EXISTS collection_entries (
         id INTEGER PRIMARY KEY,
         scryfall_id TEXT NOT NULL,
@@ -234,16 +242,15 @@ async function replaceCatalog(catalog: Database, source: BulkExport, force: bool
 }
 
 const cardSummary = 'id, scryfall_id, name, set_code, collector_number, language, image_uris'
-const mainBinder = 'main'
 const sortOrders = {
   name: 'name COLLATE NOCASE, set_code, collector_number, id',
   'name-desc': 'name COLLATE NOCASE DESC, set_code, collector_number, id',
   set: 'set_name COLLATE NOCASE, set_code, CAST(collector_number AS INTEGER), collector_number, id',
 }
 
-function catalogRows(catalog: Database, offset: number) {
-  const conditions = ['instr(lower(name), lower(?)) > 0']
-  const values: (string | number)[] = [filters.query.trim()]
+function catalogResults(catalog: Database, page: number) {
+  const conditions = ['(instr(lower(name), lower(?)) > 0 OR lower(scryfall_id) = lower(?))']
+  const values: (string | number)[] = [filters.query.trim(), filters.query.trim()]
   if (filters.languages.length) {
     conditions.push(`language IN (${filters.languages.map(() => '?').join(', ')})`)
     values.push(...filters.languages)
@@ -259,17 +266,21 @@ function catalogRows(catalog: Database, offset: number) {
   }
   if (filters.finish === 'foil' || filters.finish === 'nonfoil') conditions.push(`${filters.finish} = 1`)
 
-  return catalog.selectObjects(
-    `SELECT ${cardSummary} FROM card_printings
-     WHERE ${conditions.join(' AND ')} ORDER BY ${sortOrders[filters.sort] ?? sortOrders.name}
-     LIMIT ? OFFSET ?`,
-    [...values, binderSpreadSize + 1, offset],
+  const from = `FROM card_printings WHERE ${conditions.join(' AND ')}`
+  const matchCount = catalogMatchCount ??= Number(catalog.selectValue(`SELECT count(*) ${from}`, values))
+  const lastPage = Math.max(0, Math.ceil(matchCount / binderSpreadSize) - 1)
+  const currentPage = Math.min(page, lastPage)
+  const rows = catalog.selectObjects(
+    `SELECT ${cardSummary} ${from}
+     ORDER BY ${sortOrders[filters.sort] ?? sortOrders.name} LIMIT ? OFFSET ?`,
+    [...values, binderSpreadSize, currentPage * binderSpreadSize],
   )
+  return { rows, matchCount, page: currentPage }
 }
 
 function collectionRows({ catalog, collection }: Awaited<ReturnType<typeof openCatalog>>, offset: number) {
   const conditions = ['binder = ?', 'slot IS NOT NULL']
-  const values: (string | number)[] = [mainBinder]
+  const values: (string | number)[] = [activeBinderId]
   if (!binderFilters) {
     conditions.push('slot >= ?', 'slot < ?')
     values.push(offset, offset + binderSpreadCapacity)
@@ -290,11 +301,16 @@ function collectionRows({ catalog, collection }: Awaited<ReturnType<typeof openC
      FROM collection_entries WHERE ${conditions.join(' AND ')} ORDER BY ${ordering}`,
     values,
   )
-  const filterByPrinting = binderFilters && (binderFilters.name || binderFilters.typeLine || binderFilters.color ||
+  const metadataFilters = binderFilters && (binderFilters.typeLine || binderFilters.color ||
     binderFilters.manaCost || binderFilters.sets)
+  const query = binderFilters?.query.toLowerCase()
+  const filterByPrinting = metadataFilters || query
   const printings = binderFilters && (filterByPrinting || customSort)
     ? matchingPrintings(catalog, binderFilters, entries.map((entry) => entry.scryfall_id)) : null
-  const matchingEntries = filterByPrinting ? entries.filter((entry) => printings?.has(entry.scryfall_id)) : entries
+  // The saved ID can still match when the printing is missing from the local catalog.
+  const matchingEntries = filterByPrinting ? entries.filter((entry) =>
+    printings?.has(entry.scryfall_id) || (!metadataFilters && String(entry.scryfall_id).toLowerCase() === query),
+  ) : entries
   const visibleEntries = customSort && printings ? sortByBinderPriorities(matchingEntries, printings) : matchingEntries
   const rows = Array.from({ length: binderSpreadCapacity }, (_, index) => {
     const entry = binderFilters ? visibleEntries[offset + index] : entries.find((entry) => entry.slot === offset + index)
@@ -354,9 +370,9 @@ function sortByBinderPriorities<T extends Record<string, unknown>>(
 function matchingPrintings(catalog: Database, filters: BinderFilters, ids: unknown[]) {
   const conditions = ['scryfall_id IN (SELECT value FROM json_each(?))']
   const values: (string | number)[] = [JSON.stringify([...new Set(ids)])]
-  if (filters.name) {
-    conditions.push('instr(lower(name), lower(?)) > 0')
-    values.push(filters.name)
+  if (filters.query) {
+    conditions.push('(instr(lower(name), lower(?)) > 0 OR lower(scryfall_id) = lower(?))')
+    values.push(filters.query, filters.query)
   }
   if (filters.typeLine) {
     conditions.push('instr(lower(type_line), lower(?)) > 0')
@@ -422,7 +438,7 @@ function printingDetails({ catalog, collection }: Awaited<ReturnType<typeof open
 
 function lastBinderSlot(collection: Database) {
   return Number(collection.selectValue(
-    'SELECT max(slot) FROM collection_entries WHERE binder = ?', [mainBinder],
+    'SELECT max(slot) FROM collection_entries WHERE binder = ?', [activeBinderId],
   ) ?? -1)
 }
 
@@ -437,17 +453,17 @@ function reserveNextSpread(collection: Database) {
 
   const occupied = Number(collection.selectValue(
     'SELECT count(*) FROM collection_entries WHERE binder = ? AND slot >= ? AND slot < ?',
-    [mainBinder, rightPageStart, rightPageStart + pageSize],
+    [activeBinderId, rightPageStart, rightPageStart + pageSize],
   ))
   if (occupied < pageSize - 1) return
 
   const spreads = spread + 2
-  const reserved = Number(collection.selectValue('SELECT spreads FROM binder_page_reserve WHERE binder = ?', [mainBinder]) ?? 1)
+  const reserved = Number(collection.selectValue('SELECT spreads FROM binder_page_reserve WHERE binder = ?', [activeBinderId]) ?? 1)
   if (reserved >= spreads) return
   collection.exec({
     sql: `INSERT INTO binder_page_reserve (binder, spreads) VALUES (?, ?)
           ON CONFLICT(binder) DO UPDATE SET spreads = max(spreads, excluded.spreads)`,
-    bind: [mainBinder, spreads],
+    bind: [activeBinderId, spreads],
   })
 }
 
@@ -460,7 +476,7 @@ function editBinder({ catalog, collection }: Awaited<ReturnType<typeof openCatal
   }
 
   collection.transaction(() => {
-    const target = collection.selectValue('SELECT id FROM collection_entries WHERE binder = ? AND slot = ?', [mainBinder, slot])
+    const target = collection.selectValue('SELECT id FROM collection_entries WHERE binder = ? AND slot = ?', [activeBinderId, slot])
     if (request.type === 'place') {
       if (target != null) throw new Error('Choose an empty pocket for this card.')
       const printing = catalog.selectObject('SELECT foil, nonfoil FROM card_printings WHERE scryfall_id = ?', [request.scryfallId])
@@ -469,13 +485,13 @@ function editBinder({ catalog, collection }: Awaited<ReturnType<typeof openCatal
       collection.exec({
         sql: `INSERT INTO collection_entries (scryfall_id, quantity, finish, condition, binder, slot)
               VALUES (?, 1, ?, 'unspecified', ?, ?)`,
-        bind: [request.scryfallId, request.finish, mainBinder, slot],
+        bind: [request.scryfallId, request.finish, activeBinderId, slot],
       })
       reserveNextSpread(collection)
       return
     }
 
-    const source = collection.selectValue('SELECT id FROM collection_entries WHERE binder = ? AND slot = ?', [mainBinder, request.from])
+    const source = collection.selectValue('SELECT id FROM collection_entries WHERE binder = ? AND slot = ?', [activeBinderId, request.from])
     if (source == null) throw new Error('The selected card is no longer in that pocket.')
     if (source === target) return
     const sql = 'UPDATE collection_entries SET slot = ? WHERE id = ?'
@@ -500,11 +516,11 @@ function updateSelectedCards(collection: Database, request: Extract<CatalogReque
       collection.exec({
         sql: `INSERT INTO binder_page_reserve (binder, spreads) VALUES (?, ?)
               ON CONFLICT(binder) DO UPDATE SET spreads = max(spreads, excluded.spreads)`,
-        bind: [mainBinder, spreads],
+        bind: [activeBinderId, spreads],
       })
     }
     for (const { slot, collectionId } of request.targets) {
-      const bind = [collectionId, mainBinder, slot]
+      const bind = [collectionId, activeBinderId, slot]
       const matches = collection.selectValue(
         'SELECT id FROM collection_entries WHERE id = ? AND binder = ? AND slot = ?', bind,
       )
@@ -521,13 +537,57 @@ function updateSelectedCards(collection: Database, request: Extract<CatalogReque
   })
 }
 
+function exportBinder(collection: Database, request: Extract<CatalogRequest, { type: 'export-binder' }>): BinderFile {
+  const { binderId, preferences } = request
+  const name = collection.selectValue('SELECT name FROM saved_binders WHERE id = ?', [binderId])
+  if (typeof name !== 'string') throw new Error('This binder could not be found.')
+  const cards: BinderFileCard[] = collection.selectObjects(
+    `SELECT scryfall_id, slot, quantity, finish, condition,
+            (SELECT json_group_array(tag) FROM collection_tags WHERE collection_id = collection_entries.id) AS tags
+     FROM collection_entries WHERE binder = ? ORDER BY slot, id`, [binderId],
+  ).map((row) => ({
+    scryfallId: String(row.scryfall_id), slot: row.slot == null ? null : Number(row.slot), quantity: Number(row.quantity),
+    finish: row.finish as OwnedFinish, condition: String(row.condition), tags: JSON.parse(String(row.tags)),
+  }))
+  const reservedSpreads = Number(collection.selectValue(
+    'SELECT spreads FROM binder_page_reserve WHERE binder = ?', [binderId],
+  ) ?? 1)
+  return { version: 1, name, reservedSpreads, preferences, cards }
+}
+
+function importBinder(collection: Database, binderId: string, file: BinderFile) {
+  collection.transaction(() => {
+    collection.exec({ sql: 'INSERT INTO saved_binders (id, name) VALUES (?, ?)', bind: [binderId, file.name] })
+    collection.exec({
+      sql: 'INSERT INTO binder_page_reserve (binder, spreads) VALUES (?, ?)',
+      bind: [binderId, file.reservedSpreads],
+    })
+    for (const card of file.cards) {
+      const id = collection.selectValue(
+        `INSERT INTO collection_entries (scryfall_id, slot, quantity, finish, condition, binder)
+         VALUES (?, ?, ?, ?, ?, ?) RETURNING id`,
+        [card.scryfallId, card.slot, card.quantity, card.finish, card.condition, binderId],
+      )
+      for (const tag of card.tags) {
+        collection.exec({
+          sql: 'INSERT INTO collection_tags (collection_id, tag) VALUES (?, ?) ON CONFLICT DO NOTHING',
+          bind: [Number(id), tag],
+        })
+      }
+    }
+  })
+}
+
 function publishResults(db: Awaited<ReturnType<typeof openCatalog>>, edited = false) {
   const capacity = view === 'binder' ? binderSpreadCapacity : binderSpreadSize
   const offset = activePage * capacity
   let matchCount: number | null = null
   let rows
   if (view === 'catalog') {
-    rows = catalogRows(db.catalog, offset)
+    const result = catalogResults(db.catalog, activePage)
+    rows = result.rows
+    matchCount = result.matchCount
+    activePage = result.page
   } else {
     let result = collectionRows(db, offset)
     if (binderFilters) {
@@ -542,21 +602,21 @@ function publishResults(db: Awaited<ReturnType<typeof openCatalog>>, edited = fa
   }
   const lastSlot = lastBinderSlot(db.collection)
   const reservedSpreads = Number(db.collection.selectValue(
-    'SELECT spreads FROM binder_page_reserve WHERE binder = ?', [mainBinder],
+    'SELECT spreads FROM binder_page_reserve WHERE binder = ?', [activeBinderId],
   ) ?? 1)
   self.postMessage({
     type: 'results',
     view, languages, edited, lastSlot, reservedSpreads,
+    activeBinderId,
+    binders: db.collection.selectObjects('SELECT id, name FROM saved_binders ORDER BY rowid'),
     rows: rows.slice(0, capacity),
     page: activePage,
-    hasMore: matchCount !== null ? (activePage + 1) * capacity < matchCount
-      : view === 'binder' || rows.length > binderSpreadSize,
     matchCount, binderMetadataReady,
     binderTags: view === 'binder' ? db.collection.selectObjects(
       `SELECT min(tag COLLATE BINARY) AS tag FROM collection_tags
        JOIN collection_entries ON collection_entries.id = collection_id
        WHERE binder = ? AND slot IS NOT NULL GROUP BY collection_tags.tag COLLATE NOCASE
-       ORDER BY min(tag COLLATE BINARY) COLLATE NOCASE`, [mainBinder],
+       ORDER BY min(tag COLLATE BINARY) COLLATE NOCASE`, [activeBinderId],
     ).map((row) => String(row.tag)) : [],
     updatedAt: db.catalog.selectValue('SELECT updated_at FROM catalog_version WHERE id = 1') ?? null,
   })
@@ -589,6 +649,7 @@ async function syncCatalog(db: Awaited<ReturnType<typeof openCatalog>>, force: b
     if (force || !binderMetadataReady || !legalitiesReady || typeof localVersion !== 'string' || Date.parse(localVersion) < Date.parse(source.updated_at)) {
       self.postMessage({ type: 'sync', message: 'Downloading and importing the full card catalog…' })
       await replaceCatalog(catalog, source, force)
+      catalogMatchCount = undefined
       refreshLanguages(catalog)
       if (view === 'catalog') activePage = 0
       publishResults(db)
@@ -611,6 +672,23 @@ self.onmessage = async ({ data }: MessageEvent<CatalogRequest>) => {
       self.postMessage({ type: 'details', scryfallId: data.scryfallId, details: printingDetails(db, data.scryfallId) })
       return
     }
+    if (data.type === 'export-binder') {
+      self.postMessage({ type: 'binder-export', format: data.format, file: exportBinder(db.collection, data) })
+      return
+    }
+    if (data.type === 'import-binder') {
+      importBinder(db.collection, data.binderId, data.file)
+      activeBinderId = data.binderId
+      const { rows, columns, binderSorting: sorting } = data.file.preferences
+      binderSpreadCapacity = rows * columns * 2
+      binderSorting = sorting
+      binderFilters = null
+      view = 'binder'
+      activePage = 0
+      customBinderPage = 0
+      publishResults(db, true)
+      return
+    }
     if (data.type === 'filter-binder') {
       if (view !== 'binder') throw new Error('Open the binder before applying filters.')
       if (!binderFilters) customBinderPage = activePage
@@ -629,6 +707,38 @@ self.onmessage = async ({ data }: MessageEvent<CatalogRequest>) => {
       publishResults(db, true)
       return
     }
+    if (data.type === 'create-binder' || data.type === 'rename-binder') {
+      const name = data.name.trim()
+      if (!name || name.length > 60) throw new Error('Enter a binder name between 1 and 60 characters.')
+      if (data.type === 'rename-binder') {
+        db.collection.exec({ sql: 'UPDATE saved_binders SET name = ? WHERE id = ?', bind: [name, activeBinderId] })
+        publishResults(db)
+        return
+      }
+      const id = crypto.randomUUID()
+      db.collection.exec({ sql: 'INSERT INTO saved_binders (id, name) VALUES (?, ?)', bind: [id, name] })
+      activeBinderId = id
+    }
+    if (data.type === 'switch-binder' || data.type === 'load') {
+      const id = data.binderId ?? defaultBinderId
+      if (db.collection.selectValue('SELECT id FROM saved_binders WHERE id = ?', [id]) == null) {
+        if (data.type === 'switch-binder') throw new Error('This binder could not be found.')
+        activeBinderId = defaultBinderId
+      } else {
+        activeBinderId = id
+      }
+    }
+    if (data.type === 'create-binder' || data.type === 'switch-binder') {
+      view = 'binder'
+      binderFilters = null
+      activePage = 0
+      customBinderPage = 0
+      binderSpreadCapacity = data.pageSize * 2
+      binderSorting = data.binderSorting
+      reserveNextSpread(db.collection)
+      publishResults(db)
+      return
+    }
     if (data.type === 'load') refreshLanguages(db.catalog)
     if (data.type === 'layout' || data.type === 'load') {
       binderSorting = data.binderSorting ?? defaultBinderSorting
@@ -645,7 +755,10 @@ self.onmessage = async ({ data }: MessageEvent<CatalogRequest>) => {
       view = data.view
       binderFilters = null
     }
-    if (data.type === 'search') filters = data.filters
+    if (data.type === 'search') {
+      filters = data.filters
+      catalogMatchCount = undefined
+    }
     if (data.type === 'page') activePage = data.page
     else if (data.type !== 'layout' || view === 'binder') activePage = 0
     publishResults(db)

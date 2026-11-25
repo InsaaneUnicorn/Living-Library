@@ -122,6 +122,32 @@
   width: 8rem;
 }
 
+.binder-manager {
+  padding-bottom: 0.75rem;
+  border-bottom: 1px solid var(--site-border);
+}
+
+.binder-manager h2 {
+  flex-basis: 100%;
+  margin: 0;
+  color: inherit;
+  font-size: 1rem;
+  font-weight: 650;
+}
+
+.binder-manager select {
+  max-width: min(18rem, 70vw);
+}
+
+.binder-manager .binder-name-form {
+  flex-basis: 100%;
+  margin: 0;
+}
+
+.binder-name-form input:not([type='checkbox']) {
+  width: 14rem;
+}
+
 .language-filter {
   position: relative;
 }
@@ -752,8 +778,38 @@
 }
 
 @media (max-width: 35rem) {
+  .catalog-nav {
+    position: static;
+  }
+
   .page-controls {
     flex-wrap: wrap;
+  }
+
+  .binder:not(.binder-closed) {
+    flex-direction: column;
+  }
+
+  .binder[data-binding]:not(.binder-closed)::before {
+    display: none;
+  }
+
+  .catalog-nav button,
+  .page-controls button,
+  .catalog-filters button,
+  .binder-selection button {
+    min-height: 44px;
+  }
+
+  .catalog-filters label,
+  .binder-selection label {
+    max-width: 100%;
+  }
+
+  .catalog-filters :is(input, select),
+  .binder-selection input {
+    box-sizing: border-box;
+    max-width: 100%;
   }
 }
 

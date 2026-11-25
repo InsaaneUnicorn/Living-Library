@@ -1,3 +1,6 @@
+import type { BinderFile, BinderFileFormat } from './binderTransfer'
+import type { Preferences } from './preferences'
+
 export const binderColumns = 3
 export const binderRows = 3
 export const binderPageSize = binderColumns * binderRows
@@ -7,6 +10,9 @@ export const binderSpreadSize = binderPageSize * binderPagesPerSpread
 export type View = 'catalog' | 'binder'
 export type OwnedFinish = 'foil' | 'nonfoil' | 'unspecified'
 export type SelectionTarget = { slot: number; collectionId: number }
+export const defaultBinderId = 'main'
+export type SavedBinder = { id: string; name: string }
+type BinderLayout = { pageSize: number; binderSorting: BinderSorting }
 
 export const binderSortFields = {
   tag: 'Tag', name: 'Name', type: 'Card type', color: 'Mana color', mana: 'Mana value', set: 'Set',
@@ -17,7 +23,7 @@ export type BinderSorting = { rules: BinderSortRule[]; prioritizedTags: string }
 export const defaultBinderSorting: BinderSorting = { rules: [{ field: 'tag', direction: 'asc' }], prioritizedTags: '' }
 
 export type BinderFilters = {
-  name: string
+  query: string
   typeLine: string
   color: string
   manaCost: string
@@ -27,7 +33,7 @@ export type BinderFilters = {
 }
 
 export const defaultBinderFilters: BinderFilters = {
-  name: '', typeLine: '', color: '', manaCost: '', sets: '', tag: '', tagOrder: '',
+  query: '', typeLine: '', color: '', manaCost: '', sets: '', tag: '', tagOrder: '',
 }
 
 export const legalityFormatNames: Record<string, string> = {
@@ -59,7 +65,12 @@ export type CatalogFilters = {
 }
 
 export type CatalogRequest =
-  | { type: 'load'; pageSize?: number; binderSorting?: BinderSorting }
+  | { type: 'load'; pageSize?: number; binderSorting?: BinderSorting; binderId?: string }
+  | ({ type: 'create-binder'; name: string } & BinderLayout)
+  | ({ type: 'switch-binder'; binderId: string } & BinderLayout)
+  | { type: 'rename-binder'; name: string }
+  | { type: 'export-binder'; binderId: string; format: BinderFileFormat; preferences: Preferences }
+  | { type: 'import-binder'; binderId: string; file: BinderFile }
   | { type: 'view'; view: View }
   | { type: 'search'; filters: CatalogFilters }
   | { type: 'filter-binder'; filters: BinderFilters }

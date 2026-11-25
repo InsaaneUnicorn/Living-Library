@@ -1,9 +1,11 @@
 import { Fragment, useEffect, useRef, useState } from 'react'
 import { binderColumns, binderPageSize, binderPagesPerSpread, binderRows, binderSpreadSize, defaultBinderFilters, defaultFilters, legalityFormatNames } from './binder'
-import type { BinderFilters, CatalogFilters, CatalogRequest, OwnedFinish, PrintingDetails, SelectionTarget, View } from './binder'
+import type { BinderFilters, CatalogFilters, CatalogRequest, OwnedFinish, PrintingDetails, SavedBinder, SelectionTarget, View } from './binder'
 import { BinderCover, Settings } from './Settings'
-import { readPreferences, savePreferences } from './preferences'
+import { defaultPreferences, readActiveBinder, readPreferences, removeImportedPreferences, saveActiveBinder, savePreferences } from './preferences'
 import type { Preferences } from './preferences'
+import { maxBinderFileSize, parseBinder, serializeBinder } from './binderTransfer'
+import type { BinderFile, BinderFileFormat } from './binderTransfer'
 import './App.css'
 
 type Printing = {
@@ -21,9 +23,11 @@ type Printing = {
 }
 
 type WorkerResponse =
-  | { type: 'results'; rows: Pocket[]; page: number; hasMore: boolean; updatedAt: string | null;
+  | { type: 'binder-export'; format: BinderFileFormat; file: BinderFile }
+  | { type: 'results'; rows: Pocket[]; page: number; updatedAt: string | null;
       view: View; languages: string[]; edited: boolean; lastSlot: number; reservedSpreads: number;
-      matchCount: number | null; binderMetadataReady: boolean; binderTags: string[] }
+      matchCount: number | null; binderMetadataReady: boolean; binderTags: string[];
+      activeBinderId: string; binders: SavedBinder[] }
   | { type: 'sync'; message: string }
   | { type: 'details'; scryfallId: string; details: PrintingDetails }
   | { type: 'error'; operation: CatalogRequest['type']; message: string; scryfallId?: string }
@@ -192,12 +196,31 @@ function sheetCards(cards: Pocket[], side: number, pageSize: number) {
   return cards.slice(side * pageSize, (side + 1) * pageSize)
 }
 
+function downloadBinder(file: BinderFile, format: BinderFileFormat) {
+  const url = URL.createObjectURL(new Blob([serializeBinder(file, format)], {
+    type: format === 'json' ? 'application/json' : 'text/csv;charset=utf-8',
+  }))
+  const link = document.createElement('a')
+  const filename = file.name.replace(/[<>:"/\\|?*\p{Cc}]/gu, '_').replace(/[. ]+$/, '') || 'binder'
+  link.href = url
+  link.download = `binder-${filename}.${format}`
+  document.body.appendChild(link)
+  link.click()
+  link.remove()
+  window.setTimeout(() => URL.revokeObjectURL(url), 30_000)
+}
+
 function App() {
   const workerRef = useRef<Worker | null>(null)
+  const importInput = useRef<HTMLInputElement>(null)
+  const pendingImport = useRef<string | null>(null)
   const pendingTurn = useRef<(PageTurn & { page: number }) | null>(null)
   const [cards, setCards] = useState<Pocket[]>([])
-  const [busy, setBusy] = useState(true)
+  const [workerBusy, setBusy] = useState(true)
+  const [readingImport, setReadingImport] = useState(false)
+  const busy = workerBusy || readingImport
   const [error, setError] = useState('')
+  const [transferStatus, setTransferStatus] = useState('')
   const [view, setView] = useState<View>('catalog')
   const [filters, setFilters] = useState(defaultFilters)
   const [binderFilterDraft, setBinderFilterDraft] = useState(defaultBinderFilters)
@@ -209,14 +232,21 @@ function App() {
   const [selectedCards, setSelectedCards] = useState<SelectionTarget[] | null>(null)
   const [tagName, setTagName] = useState('')
   const [preview, setPreview] = useState<Preview | null>(null)
-  const [preferences, setPreferences] = useState(readPreferences)
+  const [binderId, setBinderId] = useState(readActiveBinder)
+  const acknowledgedBinder = useRef(binderId)
+  const initialBinderId = useRef(binderId)
+  const [binders, setBinders] = useState<SavedBinder[]>([])
+  const activeBinder = binders.find((binder) => binder.id === binderId)
+  const binderActionsDisabled = busy || !activeBinder
+  const [binderNameForm, setBinderNameForm] = useState<'create' | 'rename' | null>(null)
+  const [binderName, setBinderName] = useState('')
+  const [preferences, setPreferences] = useState(() => readPreferences(binderId))
   const initialPageSize = useRef(preferences.rows * preferences.columns)
   const initialBinderSorting = useRef(preferences.binderSorting)
   const [settingsOpen, setSettingsOpen] = useState(false)
   const [cover, setCover] = useState<'front' | 'back' | null>(null)
   const [lastSlot, setLastSlot] = useState(-1)
   const [reservedSpreads, setReservedSpreads] = useState(1)
-  const [hasMore, setHasMore] = useState(false)
   const [page, setPage] = useState(0)
   const [turn, setTurn] = useState<PageTurn | null>(null)
   const [updatedAt, setUpdatedAt] = useState<string | null>(null)
@@ -229,11 +259,22 @@ function App() {
     worker.onmessage = ({ data }: MessageEvent<WorkerResponse>) => {
       if (data.type === 'results') {
         const requestedTurn = pendingTurn.current
-        setTurn(requestedTurn?.page === data.page && !window.matchMedia('(prefers-reduced-motion: reduce)').matches
+        setTurn(requestedTurn?.page === data.page && !window.matchMedia('(prefers-reduced-motion: reduce), (max-width: 35rem)').matches
           ? requestedTurn
           : null)
         pendingTurn.current = null
         setCards(data.rows)
+        setBinders(data.binders)
+        if (data.activeBinderId === pendingImport.current) {
+          pendingImport.current = null
+          setTransferStatus('Binder imported.')
+        }
+        if (data.activeBinderId !== acknowledgedBinder.current) {
+          acknowledgedBinder.current = data.activeBinderId
+          setBinderId(data.activeBinderId)
+          setPreferences(readPreferences(data.activeBinderId))
+          saveActiveBinder(data.activeBinderId)
+        }
         setView(data.view)
         setLanguages(data.languages)
         setLastSlot(data.lastSlot)
@@ -242,12 +283,19 @@ function App() {
           setSelection(null)
           setSelectedCards(null)
         }
-        setHasMore(data.hasMore)
         setMatchCount(data.matchCount)
         setBinderMetadataReady(data.binderMetadataReady)
         setBinderTags(data.binderTags)
         setPage(data.page)
         setUpdatedAt(data.updatedAt)
+        setBusy(false)
+      } else if (data.type === 'binder-export') {
+        try {
+          downloadBinder(data.file, data.format)
+          setTransferStatus(`Binder exported as ${data.format.toUpperCase()}.`)
+        } catch {
+          setError('The binder file could not be downloaded.')
+        }
         setBusy(false)
       } else if (data.type === 'details') {
         setPreview((current) => current?.card.scryfall_id === data.scryfallId
@@ -262,6 +310,10 @@ function App() {
         setPreview((current) => current && current.card.scryfall_id === data.scryfallId
           ? { ...current, error: data.message } : current)
       } else {
+        if (data.operation === 'import-binder' && pendingImport.current) {
+          removeImportedPreferences(pendingImport.current)
+          pendingImport.current = null
+        }
         pendingTurn.current = null
         setError(data.message)
         setBusy(false)
@@ -272,7 +324,8 @@ function App() {
       setBusy(false)
       setSyncStatus('')
     }
-    worker.postMessage({ type: 'load', pageSize: initialPageSize.current, binderSorting: initialBinderSorting.current })
+    worker.postMessage({ type: 'load', pageSize: initialPageSize.current,
+      binderSorting: initialBinderSorting.current, binderId: initialBinderId.current })
     function checkForUpdates() {
       if (navigator.onLine) worker.postMessage({ type: 'sync' })
     }
@@ -296,6 +349,36 @@ function App() {
     worker.postMessage(request)
   }
 
+  async function importBinderFile(file: File | undefined) {
+    const worker = workerRef.current
+    if (!file || !worker || busy) return
+    setReadingImport(true)
+    setError('')
+    setTransferStatus('')
+    try {
+      if (file.size > maxBinderFileSize) throw new Error('Choose a binder file smaller than 10 MB.')
+      const extension = file.name.split('.').pop()?.toLowerCase()
+      if (extension !== 'json' && extension !== 'csv') throw new Error('Choose a JSON or CSV binder file.')
+      const imported = parseBinder(await file.text(), extension)
+      const id = crypto.randomUUID()
+      try {
+        savePreferences(imported.preferences, id)
+      } catch {
+        throw new Error('There is not enough local storage to save this binder’s settings.')
+      }
+      pendingImport.current = id
+      setCover(null)
+      setTurn(null)
+      setBinderNameForm(null)
+      setBinderFilterDraft(defaultBinderFilters)
+      requestPrintings({ type: 'import-binder', binderId: id, file: imported })
+    } catch (error) {
+      setError(error instanceof Error ? error.message : 'The binder could not be imported.')
+    } finally {
+      setReadingImport(false)
+    }
+  }
+
   const rows = view === 'binder' ? preferences.rows : binderRows
   const columns = view === 'binder' ? preferences.columns : binderColumns
   const pageSize = view === 'binder' ? rows * columns : binderPageSize
@@ -303,8 +386,18 @@ function App() {
   const spreadCount = Math.max(preferences.spreads, reservedSpreads, Math.floor(lastSlot / spreadSize) + 1)
   const filteredBinder = view === 'binder' && matchCount !== null
   const customBinder = view === 'binder' && !filteredBinder
+  const totalBinderPages = spreadCount * binderPagesPerSpread
+  const totalResultPages = Math.ceil((matchCount ?? 0) / spreadSize)
+  const resultsRange = matchCount
+    ? `${page * spreadSize + 1}–${Math.min((page + 1) * spreadSize, matchCount)} of ${matchCount}`
+    : ''
+  const pageLabel = customBinder
+    ? cover
+      ? `${cover === 'front' ? 'Front cover' : 'Back cover'} · ${totalBinderPages} pages`
+      : `Pages ${page * binderPagesPerSpread + 1}–${(page + 1) * binderPagesPerSpread} of ${totalBinderPages}`
+    : totalResultPages ? `Page ${page + 1} of ${totalResultPages}` : '0 pages'
   const canGoPrevious = customBinder ? cover !== 'front' : page > 0
-  const canGoNext = customBinder ? cover !== 'back' : hasMore
+  const canGoNext = customBinder ? cover !== 'back' : page + 1 < totalResultPages
 
   function turnPage(direction: 'next' | 'previous') {
     if (busy || turn || (direction === 'next' ? !canGoNext : !canGoPrevious)) return
@@ -337,12 +430,22 @@ function App() {
     requestPrintings({ type: 'view', view: nextView })
   }
 
+  function openBinder(request: Extract<CatalogRequest, { type: 'create-binder' | 'switch-binder' }>) {
+    if (busy) return
+    setCover(null)
+    setTurn(null)
+    setSelectedCards(null)
+    setSelection((current) => current?.from === undefined ? current : null)
+    setBinderFilterDraft(defaultBinderFilters)
+    requestPrintings(request)
+  }
+
   function applyBinderFilters(filters: BinderFilters) {
     setCover(null)
     setTurn(null)
     setSelectedCards(null)
     requestPrintings({ type: 'filter-binder', filters: {
-      name: filters.name.trim(),
+      query: filters.query.trim(),
       typeLine: filters.typeLine.trim(),
       color: filters.color,
       manaCost: filters.manaCost.trim(),
@@ -353,7 +456,7 @@ function App() {
   }
 
   function applySettings(next: Preferences) {
-    savePreferences(next)
+    savePreferences(next, binderId)
     const layoutChanged = next.rows !== preferences.rows || next.columns !== preferences.columns
     setPreferences(next)
     setSettingsOpen(false)
@@ -371,7 +474,7 @@ function App() {
   function addSpread() {
     const next = { ...preferences, spreads: spreadCount + 1 }
     try {
-      savePreferences(next)
+      savePreferences(next, binderId)
     } catch {
       setError('The new spread could not be saved on this device.')
       return
@@ -440,14 +543,19 @@ function App() {
         <button type="button" aria-pressed={view === 'binder'} disabled={busy}
           onClick={() => changeView('binder')}>Show Binder</button>
         <button type="button" disabled={busy} onClick={() => setSettingsOpen(true)}>Settings</button>
-        {view === 'catalog' && <form id="catalog-search" role="search" onSubmit={(event) => {
+        <form id="card-search" role="search" onSubmit={(event) => {
           event.preventDefault()
-          requestPrintings({ type: 'search', filters })
+          if (view === 'catalog') requestPrintings({ type: 'search', filters })
+          else if (!busy && !selection) applyBinderFilters(binderFilterDraft)
         }}>
-          <input type="search" aria-label="Search by card name" placeholder="Search by card name"
-            value={filters.query} onChange={(event) => setFilters({ ...filters, query: event.target.value })} />
-          <button type="submit" disabled={busy}>Search</button>
-        </form>}
+          <input type="search" aria-label="Search by card name or Scryfall ID" placeholder="Card name or Scryfall ID"
+            value={view === 'catalog' ? filters.query : binderFilterDraft.query} onChange={(event) => {
+              const query = event.target.value
+              if (view === 'catalog') setFilters({ ...filters, query })
+              else setBinderFilterDraft({ ...binderFilterDraft, query })
+            }} />
+          <button type="submit" disabled={busy || Boolean(selection)}>Search</button>
+        </form>
         <button type="button" disabled={busy || Boolean(syncStatus)} onClick={() => {
           if (navigator.onLine) workerRef.current?.postMessage({ type: 'sync', force: true })
           else setSyncError('Connect to the internet to check for catalog updates.')
@@ -456,6 +564,60 @@ function App() {
         </button>
       </nav>
       <main className="catalog-main">
+        <section className="catalog-filters binder-manager" aria-labelledby="binders-heading">
+          <h2 id="binders-heading">My Binders</h2>
+          <label>Active binder <select aria-label="Binder" value={activeBinder ? binderId : ''}
+            disabled={binderActionsDisabled} onChange={(event) => {
+            const id = event.target.value
+            const { rows, columns, binderSorting } = readPreferences(id)
+            setBinderNameForm(null)
+            openBinder({ type: 'switch-binder', binderId: id, pageSize: rows * columns, binderSorting })
+          }}>
+            {!activeBinder && <option value="">{workerBusy ? 'Loading binders…' : 'Binders unavailable'}</option>}
+            {binders.map(({ id, name }) => <option value={id} key={id}>{name}</option>)}
+          </select></label>
+          <button type="button" disabled={binderActionsDisabled} onClick={() => {
+            setBinderName('')
+            setBinderNameForm('create')
+          }}>New Binder</button>
+          <button type="button" disabled={binderActionsDisabled} onClick={() => {
+            setBinderName(activeBinder?.name ?? '')
+            setBinderNameForm('rename')
+          }}>Rename Binder</button>
+          {(['json', 'csv'] as const).map((format) => (
+            <button key={format} type="button" disabled={binderActionsDisabled} onClick={() => {
+              setTransferStatus('')
+              requestPrintings({ type: 'export-binder', binderId, format, preferences })
+            }}>Export {format.toUpperCase()}</button>
+          ))}
+          <button type="button" disabled={binderActionsDisabled} onClick={() => importInput.current?.click()}>Import Binder</button>
+          <input ref={importInput} type="file" accept=".json,.csv,application/json,text/csv" hidden
+            onChange={(event) => {
+              const file = event.currentTarget.files?.[0]
+              event.currentTarget.value = ''
+              void importBinderFile(file)
+            }} />
+          {transferStatus && <p role="status">{transferStatus}</p>}
+          {binderNameForm && <form className="catalog-filters binder-name-form" onSubmit={(event) => {
+            event.preventDefault()
+            const name = binderName.trim()
+            if (busy || !name) return
+            if (binderNameForm === 'create') {
+              const { rows, columns, binderSorting } = defaultPreferences
+              openBinder({ type: 'create-binder', name, pageSize: rows * columns, binderSorting })
+            } else {
+              requestPrintings({ type: 'rename-binder', name })
+            }
+            setBinderNameForm(null)
+          }}>
+            <label>Binder name <input autoFocus value={binderName} required maxLength={60}
+              onChange={(event) => setBinderName(event.target.value)} /></label>
+            <button type="submit" disabled={busy || !binderName.trim()}>
+              {binderNameForm === 'create' ? 'Create Binder' : 'Save Name'}
+            </button>
+            <button type="button" onClick={() => setBinderNameForm(null)}>Cancel</button>
+          </form>}
+        </section>
         {view === 'catalog' && <div className="catalog-filters" aria-label="Catalog filters" role="group">
           <details className="language-filter">
             <summary>Languages{filters.languages.length ? ` (${filters.languages.length})` : ''}</summary>
@@ -474,7 +636,7 @@ function App() {
               {!languages.length && <span>Languages appear after the catalog loads.</span>}
             </div>
           </details>
-          <label>Set <input form="catalog-search" placeholder="Name or code" value={filters.set}
+          <label>Set <input form="card-search" placeholder="Name or code" value={filters.set}
             onChange={(event) => setFilters({ ...filters, set: event.target.value })} /></label>
           <button type="button" disabled={busy} onClick={() => {
             const next = { ...filters, set: 'Secret Lair' }
@@ -501,7 +663,7 @@ function App() {
             <option value="name-desc">Name (Z–A)</option>
             <option value="set">Set and collector number</option>
           </select></label>
-          <button type="submit" form="catalog-search" disabled={busy}>Apply Filters</button>
+          <button type="submit" form="card-search" disabled={busy}>Apply Filters</button>
           <button type="button" disabled={busy} onClick={() => {
             setFilters(defaultFilters)
             requestPrintings({ type: 'search', filters: defaultFilters })
@@ -511,8 +673,6 @@ function App() {
           event.preventDefault()
           applyBinderFilters(binderFilterDraft)
         }}>
-          <label>Name <input type="search" value={binderFilterDraft.name}
-            onChange={(event) => setBinderFilterDraft({ ...binderFilterDraft, name: event.target.value })} /></label>
           <label>Card type <input placeholder="e.g. Creature" value={binderFilterDraft.typeLine}
             onChange={(event) => setBinderFilterDraft({ ...binderFilterDraft, typeLine: event.target.value })} /></label>
           <label>Mana color <select value={binderFilterDraft.color}
@@ -565,8 +725,8 @@ function App() {
             <p>Use Update Full Catalog to load card type, color, and mana cost data.</p>}
           <p role="status">
             {busy ? 'Loading…' : view === 'catalog'
-              ? (cards.length ? 'Select a card to view its details.' : 'No matching printings.')
-              : filteredBinder ? (matchCount ? `${matchCount} matching ${matchCount === 1 ? 'card' : 'cards'}` : 'No matching binder cards.')
+              ? (resultsRange ? `Showing printings ${resultsRange}` : 'No matching printings.')
+              : filteredBinder ? (resultsRange ? `Showing cards ${resultsRange}` : 'No matching binder cards.')
               : selectedCards ? 'Select cards on any binder page.' : 'Select a card to move it, or use Select Cards for multiple cards.'}
           </p>
         </div>
@@ -600,13 +760,11 @@ function App() {
             onClick={removeSelectedCards}>Remove Selected</button>
           <button type="button" disabled={busy} onClick={() => setSelectedCards(null)}>Cancel</button>
         </form>}
-        <nav className="page-controls" aria-label="Binder pages">
+        <nav className="page-controls" aria-label={customBinder ? 'Binder pages' : 'Result pages'}>
           <button type="button" disabled={busy || Boolean(turn) || !canGoPrevious} onClick={() => turnPage('previous')}>
             <span aria-hidden="true">← </span>Previous
           </button>
-          <span aria-live="polite">{cover === 'front' ? 'Front cover' : cover === 'back' ? 'Back cover'
-            : filteredBinder ? `Results ${matchCount ? page * spreadSize + 1 : 0}–${Math.min((page + 1) * spreadSize, matchCount ?? 0)}`
-            : `Pages ${page * binderPagesPerSpread + 1}–${(page + 1) * binderPagesPerSpread}`}</span>
+          <span aria-live="polite">{pageLabel}</span>
           <button type="button" disabled={busy || Boolean(turn) || !canGoNext} onClick={() => turnPage('next')}>
             Next<span aria-hidden="true"> →</span>
           </button>
