@@ -38,8 +38,12 @@ const printingColumns = ['scryfall_id', ...printingFields].join(', ')
 let database: ReturnType<typeof openCatalog> | undefined
 let view: View = 'catalog'
 let filters = defaultFilters
-let catalogMatchCount: number | undefined
-const catalogPages = new Map<number, Record<string, unknown>[]>()
+type CachedCatalogSearch = {
+  matchCount?: number
+  pages: Map<number, Record<string, unknown>[]>
+}
+const catalogSearches = new Map<string, CachedCatalogSearch>()
+const catalogSearchCacheLimit = 4
 const catalogPageCacheLimit = 8
 let catalogPage = 0
 let activePage = 0
@@ -52,6 +56,9 @@ let legalitiesReady = false
 let binderSpreadCapacity = binderSpreadSize
 let syncing = false
 let languages: string[] = []
+let nameIndexReady = false
+let nameIndexScheduled = false
+let nameIndexAttempted = false
 
 async function openCatalog() {
   const sqlite = await sqlite3InitModule()
@@ -137,6 +144,7 @@ async function openCatalog() {
     binderMetadataReady = catalog.selectValue('SELECT updated_at FROM catalog_version WHERE id = 1') != null
       && catalog.selectValue('SELECT 1 FROM card_printings WHERE type_line IS NULL LIMIT 1') == null
     legalitiesReady = catalog.selectValue('SELECT 1 FROM card_printings WHERE legalities IS NULL LIMIT 1') == null
+    nameIndexReady = catalog.selectValue("SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = 'card_name_search'") != null
     return { catalog, collection }
   } catch (error) {
     catalog.close()
@@ -154,6 +162,43 @@ function getDatabase() {
     }
     throw error
   })
+}
+
+function scheduleNameIndex(catalog: Database) {
+  if (nameIndexReady || nameIndexScheduled || nameIndexAttempted) return
+  nameIndexScheduled = true
+  // Let the saved catalog render first. If an import is in progress, its
+  // completion handler will reschedule the build against the committed data.
+  setTimeout(() => {
+    nameIndexScheduled = false
+    if (syncing) return
+    try {
+      if (catalog.selectValue('SELECT 1 FROM card_printings LIMIT 1') == null) return
+      nameIndexAttempted = true
+      catalog.transaction(() => catalog.exec(`
+        CREATE VIRTUAL TABLE card_name_search USING fts5(
+          name, content='card_printings', content_rowid='id', tokenize='trigram'
+        );
+        INSERT INTO card_name_search(card_name_search) VALUES ('rebuild');
+
+        CREATE TRIGGER card_name_search_insert AFTER INSERT ON card_printings BEGIN
+          INSERT INTO card_name_search(rowid, name) VALUES (new.id, new.name);
+        END;
+        CREATE TRIGGER card_name_search_delete AFTER DELETE ON card_printings BEGIN
+          INSERT INTO card_name_search(card_name_search, rowid, name) VALUES ('delete', old.id, old.name);
+        END;
+        CREATE TRIGGER card_name_search_update AFTER UPDATE OF name ON card_printings
+        WHEN new.name IS NOT old.name BEGIN
+          INSERT INTO card_name_search(card_name_search, rowid, name) VALUES ('delete', old.id, old.name);
+          INSERT INTO card_name_search(rowid, name) VALUES (new.id, new.name);
+        END;
+      `))
+      nameIndexReady = true
+    } catch (error) {
+      // The base catalog remains usable if FTS is unavailable or storage is full.
+      console.warn('Could not build the catalog name index; using the existing search.', error)
+    }
+  }, 1500)
 }
 
 async function* streamCards(body: ReadableStream<BufferSource>) {
@@ -273,16 +318,26 @@ const sortOrders = {
 const playableInCondition = `(EXISTS (SELECT 1 FROM json_each(legalities) WHERE key = ? AND value IN ('legal', 'restricted'))
   OR (legalities IS NULL AND EXISTS (SELECT 1 FROM json_each(allowed_formats) WHERE value = ?)))`
 
-function clearCatalogResults() {
-  catalogMatchCount = undefined
-  catalogPages.clear()
+function cachedCatalogSearch() {
+  const key = JSON.stringify([
+    filters.query.trim(), [...filters.languages].sort(), filters.set.trim(),
+    filters.legalIn, filters.finish, filters.sort,
+  ])
+  const cached: CachedCatalogSearch = catalogSearches.get(key) ?? { pages: new Map() }
+  catalogSearches.delete(key)
+  catalogSearches.set(key, cached)
+  if (catalogSearches.size > catalogSearchCacheLimit) {
+    const oldest = catalogSearches.keys().next().value
+    if (oldest !== undefined) catalogSearches.delete(oldest)
+  }
+  return cached
 }
 
 function catalogResults(catalog: Database, page: number) {
-  // Cached pages belong to the current catalog snapshot and applied filters only.
-  const cachedRows = catalogPages.get(page)
-  if (cachedRows && catalogMatchCount !== undefined) {
-    return { rows: cachedRows, matchCount: catalogMatchCount, page }
+  const cached = cachedCatalogSearch()
+  const cachedRows = cached.pages.get(page)
+  if (cachedRows && cached.matchCount !== undefined) {
+    return { rows: cachedRows, matchCount: cached.matchCount, page }
   }
 
   const conditions: string[] = []
@@ -292,6 +347,13 @@ function catalogResults(catalog: Database, page: number) {
     if (/^[\da-f]{8}(?:-[\da-f]{4}){3}-[\da-f]{12}$/i.test(query)) {
       conditions.push('scryfall_id = ?')
       values.push(query.toLowerCase())
+    } else if (nameIndexReady && [...query].length >= 3 && !query.includes(String.fromCharCode(0))) {
+      // FTS narrows the rows; the original test preserves literal substring semantics.
+      conditions.push(`id IN (
+        SELECT rowid FROM card_name_search WHERE card_name_search MATCH ?
+        UNION ALL SELECT id FROM card_printings WHERE scryfall_id = ?
+      ) AND (instr(lower(name), lower(?)) > 0 OR scryfall_id = ?)`)
+      values.push('"' + query.replaceAll('"', '""') + '"', query.toLowerCase(), query, query.toLowerCase())
     } else {
       conditions.push('(instr(lower(name), lower(?)) > 0 OR lower(scryfall_id) = lower(?))')
       values.push(query, query)
@@ -312,7 +374,7 @@ function catalogResults(catalog: Database, page: number) {
   if (filters.finish === 'foil' || filters.finish === 'nonfoil') conditions.push(`${filters.finish} = 1`)
 
   const from = conditions.length ? `FROM card_printings WHERE ${conditions.join(' AND ')}` : 'FROM card_printings'
-  const matchCount = catalogMatchCount ??= Number(catalog.selectValue(
+  const matchCount = cached.matchCount ??= Number(catalog.selectValue(
     `SELECT count(*) ${from}`, values.length ? values : undefined,
   ))
   const lastPage = Math.max(0, Math.ceil(matchCount / binderSpreadSize) - 1)
@@ -322,10 +384,10 @@ function catalogResults(catalog: Database, page: number) {
      ORDER BY ${sortOrders[filters.sort] ?? sortOrders.name} LIMIT ? OFFSET ?`,
     [...values, binderSpreadSize, currentPage * binderSpreadSize],
   )
-  catalogPages.set(currentPage, rows)
-  if (catalogPages.size > catalogPageCacheLimit) {
-    const oldestPage = catalogPages.keys().next().value
-    if (oldestPage !== undefined) catalogPages.delete(oldestPage)
+  cached.pages.set(currentPage, rows)
+  if (cached.pages.size > catalogPageCacheLimit) {
+    const oldestPage = cached.pages.keys().next().value
+    if (oldestPage !== undefined) cached.pages.delete(oldestPage)
   }
   return { rows, matchCount, page: currentPage }
 }
@@ -706,13 +768,14 @@ async function syncCatalog(db: Awaited<ReturnType<typeof openCatalog>>) {
     if (!binderMetadataReady || !legalitiesReady || typeof localVersion !== 'string' || Date.parse(localVersion) < Date.parse(source.updated_at)) {
       self.postMessage({ type: 'sync', message: 'Downloading the Scryfall snapshot to check for card changes…' })
       await refreshCatalog(catalog, source)
-      clearCatalogResults()
+      catalogSearches.clear()
       refreshLanguages(catalog)
       publishResults(db)
     }
     self.postMessage({ type: 'sync', message: '' })
   } finally {
     syncing = false
+    scheduleNameIndex(catalog)
   }
 }
 
@@ -794,7 +857,10 @@ self.onmessage = async ({ data }: MessageEvent<CatalogRequest>) => {
       publishResults(db)
       return
     }
-    if (data.type === 'load') refreshLanguages(db.catalog)
+    if (data.type === 'load') {
+      refreshLanguages(db.catalog)
+      scheduleNameIndex(db.catalog)
+    }
     if (data.type === 'layout' || data.type === 'load') {
       binderSorting = data.binderSorting ?? defaultBinderSorting
       if (data.type === 'layout' && data.pageSize === undefined) {
@@ -814,7 +880,6 @@ self.onmessage = async ({ data }: MessageEvent<CatalogRequest>) => {
       return
     }
     if (data.type === 'search') {
-      if (JSON.stringify(filters) !== JSON.stringify(data.filters)) clearCatalogResults()
       filters = data.filters
     }
     if (data.type === 'page') activePage = data.page
