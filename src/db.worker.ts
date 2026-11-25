@@ -47,7 +47,7 @@ const catalogSearchCacheLimit = 4
 const catalogPageCacheLimit = 8
 let catalogPage = 0
 let activePage = 0
-let customBinderPage = 0
+const binderPages = new Map<string, number>()
 let binderFilters: BinderFilters | null = null
 let binderSorting = defaultBinderSorting
 let activeBinderId = defaultBinderId
@@ -716,6 +716,8 @@ function publishResults(db: Awaited<ReturnType<typeof openCatalog>>, edited = fa
         activePage = lastPage
         result = collectionRows(db, activePage * capacity)
       }
+    } else {
+      binderPages.set(activeBinderId, activePage)
     }
     rows = result.rows
   }
@@ -803,15 +805,13 @@ self.onmessage = async ({ data }: MessageEvent<CatalogRequest>) => {
       binderFilters = null
       view = 'binder'
       activePage = 0
-      customBinderPage = 0
       publishResults(db, true)
       return
     }
     if (data.type === 'filter-binder') {
       if (view !== 'binder') throw new Error('Open the binder before applying filters.')
-      if (!binderFilters) customBinderPage = activePage
       binderFilters = Object.values(data.filters).some(Boolean) ? data.filters : null
-      activePage = binderFilters ? 0 : customBinderPage
+      activePage = binderFilters ? 0 : binderPages.get(activeBinderId) ?? 0
       publishResults(db)
       return
     }
@@ -849,8 +849,7 @@ self.onmessage = async ({ data }: MessageEvent<CatalogRequest>) => {
     if (data.type === 'create-binder' || data.type === 'switch-binder') {
       view = 'binder'
       binderFilters = null
-      activePage = 0
-      customBinderPage = 0
+      activePage = binderPages.get(activeBinderId) ?? 0
       binderSpreadCapacity = data.pageSize * 2
       binderSorting = data.binderSorting
       reserveNextSpread(db.collection)
@@ -870,12 +869,12 @@ self.onmessage = async ({ data }: MessageEvent<CatalogRequest>) => {
       const size = data.pageSize ?? 0
       if (Number.isInteger(size) && size >= 4 && size <= 16) binderSpreadCapacity = size * 2
       reserveNextSpread(db.collection)
-      customBinderPage = 0
+      binderPages.delete(activeBinderId)
     }
     if (data.type === 'view') {
       view = data.view
       binderFilters = null
-      activePage = view === 'catalog' ? catalogPage : 0
+      activePage = view === 'catalog' ? catalogPage : binderPages.get(activeBinderId) ?? 0
       publishResults(db)
       return
     }

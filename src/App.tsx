@@ -437,6 +437,7 @@ function App() {
     : totalResultPages ? `Page ${page + 1} of ${totalResultPages}` : '0 pages'
   const canGoPrevious = customBinder ? cover !== 'front' : page > 0
   const canGoNext = customBinder ? cover !== 'back' : page + 1 < totalResultPages
+  const jumpPageCount = customBinder ? totalBinderPages : totalResultPages
 
   function turnPage(direction: 'next' | 'previous') {
     if (busy || turn || (direction === 'next' ? !canGoNext : !canGoPrevious)) return
@@ -832,6 +833,20 @@ function App() {
           <button type="button" disabled={busy || Boolean(turn) || !canGoNext} onClick={() => turnPage('next')}>
             Next<span aria-hidden="true"> →</span>
           </button>
+          {jumpPageCount > 0 && <form className="page-jump" key={`${binderId}:${view}:${customBinder}`} onSubmit={(event) => {
+            event.preventDefault()
+            if (busy || turn) return
+            const pageNumber = Number(new FormData(event.currentTarget).get('page'))
+            if (!Number.isInteger(pageNumber) || pageNumber < 1 || pageNumber > jumpPageCount) return
+            const targetPage = Math.floor((pageNumber - 1) / (customBinder ? binderPagesPerSpread : 1))
+            event.currentTarget.reset()
+            setCover(null)
+            if (targetPage !== page) requestPrintings({ type: 'page', page: targetPage })
+          }}>
+            <label>Go to page <input name="page" type="number" inputMode="numeric" min={1} max={jumpPageCount}
+              required disabled={busy || Boolean(turn)} /></label>
+            <button type="submit" disabled={busy || Boolean(turn)}>Go</button>
+          </form>}
           {view === 'binder' && !selection && !selectedCards && <>
             {customBinder && <button type="button" disabled={busy || Boolean(turn)} onClick={addSpread}>Add Spread</button>}
             <button type="button" disabled={busy || Boolean(turn) || Boolean(cover) || (filteredBinder && matchCount === 0)}
@@ -883,6 +898,7 @@ function App() {
       {preview && <CardPreview key={preview.card.scryfall_id} preview={preview} onClose={() => setPreview(null)}
         onAdd={(finish) => {
           setSelection({ card: preview.card, finish })
+          setCover(null)
           setBinderFilterDraft(defaultBinderFilters)
           setPreview(null)
           requestPrintings({ type: 'view', view: 'binder' })
