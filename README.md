@@ -52,9 +52,10 @@ See [Chrome’s web app instructions for Android](https://support.google.com/chr
 
 ### Find and add cards
 
-- On first use, let the catalog download from Scryfall. Use **Update Full Catalog**
-  to refresh metadata and format legalities. Keep the app open and online during
-  the download.
+- On first use, let the catalog download from Scryfall. **Refresh Catalog**
+  checks for an update. When a newer snapshot is available, the app downloads
+  it, then writes only new or changed printings and removes printings missing
+  from the snapshot. Binders stay on the device and are not synced.
 - Open **Show Card Catalog**. Search by a partial card name or an exact Scryfall
   ID. Filter by language, set, playable format, or finish, then click **Apply
   Filters**. **Secret Lair Printings** narrows the list to Secret Lair sets.

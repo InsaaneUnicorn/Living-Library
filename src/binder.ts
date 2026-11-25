@@ -81,7 +81,7 @@ export type CatalogRequest =
   | { type: 'move'; from: number; slot: number }
   | { type: 'remove'; targets: SelectionTarget[] }
   | { type: 'tag'; targets: SelectionTarget[]; tag: string }
-  | { type: 'sync'; force?: boolean }
+  | { type: 'sync' }
 
 export const defaultFilters: CatalogFilters = {
   query: '', languages: [], set: '', legalIn: '', finish: '', sort: 'name',

@@ -30,10 +30,11 @@ type BulkExport = {
 }
 
 const bulkUrl = 'https://api.scryfall.com/bulk-data'
-const printingColumns = `
-  scryfall_id, name, set_code, set_name, collector_number,
-  language, foil, nonfoil, legalities, image_uris, type_line, colors, mana_value, mana_costs
-`
+const printingFields = [
+  'name', 'set_code', 'set_name', 'collector_number', 'language', 'foil', 'nonfoil',
+  'legalities', 'image_uris', 'type_line', 'colors', 'mana_value', 'mana_costs',
+]
+const printingColumns = ['scryfall_id', ...printingFields].join(', ')
 let database: ReturnType<typeof openCatalog> | undefined
 let view: View = 'catalog'
 let filters = defaultFilters
@@ -155,89 +156,87 @@ async function* streamCards(body: ReadableStream<BufferSource>) {
   }
 }
 
-async function replaceCatalog(catalog: Database, source: BulkExport, force: boolean) {
-  const response = await fetch(source.jsonl_download_uri, { cache: force ? 'reload' : 'default' })
+async function refreshCatalog(catalog: Database, source: BulkExport) {
+  const response = await fetch(source.jsonl_download_uri)
   if (!response.ok || !response.body) {
     throw new Error(`Scryfall catalog download failed (HTTP ${response.status}).`)
   }
 
-  // Keep the previous catalog visible while the new export is being staged.
-  catalog.exec('BEGIN')
   try {
+    // Track all IDs for removals, but stage full records only when stored fields differ.
+    // TEMP tables keep the live catalog unchanged while the network stream is still open.
     catalog.exec(`
-      CREATE TABLE incoming_printings AS SELECT ${printingColumns} FROM card_printings WHERE 0;
-      CREATE UNIQUE INDEX incoming_printing_id ON incoming_printings(scryfall_id);
+      CREATE TEMP TABLE seen_printings (scryfall_id TEXT PRIMARY KEY) WITHOUT ROWID;
+      CREATE TEMP TABLE changed_printings AS SELECT ${printingColumns} FROM card_printings WHERE 0;
     `)
 
-    const statement = catalog.prepare(`
-      INSERT INTO incoming_printings (${printingColumns}) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `)
     let count = 0
+    const markSeen = catalog.prepare('INSERT INTO seen_printings VALUES (?)')
     try {
+      const stageChange = catalog.prepare(`
+        WITH incoming (${printingColumns}) AS (
+          VALUES (${Array(printingFields.length + 1).fill('?').join(', ')})
+        )
+        INSERT INTO changed_printings (${printingColumns})
+        SELECT ${printingColumns} FROM incoming
+        WHERE NOT EXISTS (
+          SELECT 1 FROM card_printings AS stored WHERE stored.scryfall_id = incoming.scryfall_id
+          AND (${printingFields.map((field) => `stored.${field}`).join(', ')})
+            IS (${printingFields.map((field) => `incoming.${field}`).join(', ')})
+        )
+      `)
+      try {
       for await (const card of streamCards(response.body)) {
         const images = card.image_uris ?? card.card_faces?.map((face) => face.image_uris ?? null)
         const faceColors = card.card_faces?.filter((face) => face.colors != null)
         const colors = card.colors ?? (faceColors?.length ? [...new Set(faceColors.flatMap((face) => face.colors ?? []))] : null)
         const manaCosts = [card.mana_cost, ...(card.card_faces?.map((face) => face.mana_cost) ?? [])].filter(Boolean)
-        statement.bind([
+        markSeen.bind([card.id]).step()
+        markSeen.reset()
+        stageChange.bind([
           card.id, card.name, card.set, card.set_name, card.collector_number,
           card.lang, Number(card.finishes.includes('foil')),
           Number(card.finishes.includes('nonfoil')), JSON.stringify(card.legalities ?? {}),
           images ? JSON.stringify(images) : null,
           card.type_line ?? '', colors ? JSON.stringify(colors) : null, card.cmc ?? null, JSON.stringify(manaCosts),
         ])
-        statement.step()
-        statement.reset()
+        stageChange.step()
+        stageChange.reset()
         count += 1
         if (count % 10_000 === 0) {
-          self.postMessage({ type: 'sync', message: `Importing catalog (This will take a few minutes)… ${count.toLocaleString()} printings processed` })
+          self.postMessage({ type: 'sync', message: `Checking catalog… ${count.toLocaleString()} printings scanned` })
         }
       }
+      } finally {
+        stageChange.finalize()
+      }
     } finally {
-      statement.finalize()
+      markSeen.finalize()
     }
 
     if (!count) throw new Error('Scryfall returned an empty catalog.')
-    catalog.exec(`
-      INSERT INTO card_printings (${printingColumns})
-      SELECT ${printingColumns} FROM incoming_printings WHERE 1
-      ON CONFLICT(scryfall_id) DO UPDATE SET
-        name = excluded.name,
-        set_code = excluded.set_code,
-        set_name = excluded.set_name,
-        collector_number = excluded.collector_number,
-        language = excluded.language,
-        foil = excluded.foil,
-        nonfoil = excluded.nonfoil,
-        legalities = excluded.legalities,
-        image_uris = excluded.image_uris,
-        type_line = excluded.type_line,
-        colors = excluded.colors,
-        mana_value = excluded.mana_value,
-        mana_costs = excluded.mana_costs;
+    // Publish the catalog changes and version together, or roll both back.
+    catalog.transaction(() => {
+      catalog.exec(`
+        INSERT INTO card_printings (${printingColumns})
+        SELECT ${printingColumns} FROM changed_printings WHERE 1
+        ON CONFLICT(scryfall_id) DO UPDATE SET
+          ${printingFields.map((field) => `${field} = excluded.${field}`).join(', ')};
 
-      DELETE FROM card_printings
-      WHERE NOT EXISTS (
-        SELECT 1 FROM incoming_printings
-        WHERE incoming_printings.scryfall_id = card_printings.scryfall_id
-      );
-
-      DROP TABLE incoming_printings;
-    `)
-    catalog.exec({
-      sql: 'INSERT OR REPLACE INTO catalog_version (id, updated_at) VALUES (1, ?)',
-      bind: [source.updated_at],
+        DELETE FROM card_printings WHERE NOT EXISTS (
+          SELECT 1 FROM seen_printings
+          WHERE seen_printings.scryfall_id = card_printings.scryfall_id
+        );
+      `)
+      catalog.exec({
+        sql: 'INSERT OR REPLACE INTO catalog_version (id, updated_at) VALUES (1, ?)',
+        bind: [source.updated_at],
+      })
     })
-    catalog.exec('COMMIT')
     binderMetadataReady = true
     legalitiesReady = true
-  } catch (error) {
-    try {
-      catalog.exec('ROLLBACK')
-    } catch {
-      // SQLite can already have rolled back a failed write.
-    }
-    throw error
+  } finally {
+    catalog.exec('DROP TABLE IF EXISTS temp.changed_printings; DROP TABLE IF EXISTS temp.seen_printings;')
   }
 }
 
@@ -627,7 +626,7 @@ function refreshLanguages(catalog: Database) {
     .map((row) => String(row.language))
 }
 
-async function syncCatalog(db: Awaited<ReturnType<typeof openCatalog>>, force: boolean) {
+async function syncCatalog(db: Awaited<ReturnType<typeof openCatalog>>) {
   if (syncing) return
   const { catalog } = db
   syncing = true
@@ -646,9 +645,9 @@ async function syncCatalog(db: Awaited<ReturnType<typeof openCatalog>>, force: b
     }
 
     const localVersion = catalog.selectValue('SELECT updated_at FROM catalog_version WHERE id = 1')
-    if (force || !binderMetadataReady || !legalitiesReady || typeof localVersion !== 'string' || Date.parse(localVersion) < Date.parse(source.updated_at)) {
-      self.postMessage({ type: 'sync', message: 'Downloading and importing the full card catalog…' })
-      await replaceCatalog(catalog, source, force)
+    if (!binderMetadataReady || !legalitiesReady || typeof localVersion !== 'string' || Date.parse(localVersion) < Date.parse(source.updated_at)) {
+      self.postMessage({ type: 'sync', message: 'Downloading the Scryfall snapshot to check for card changes…' })
+      await refreshCatalog(catalog, source)
       catalogMatchCount = undefined
       refreshLanguages(catalog)
       if (view === 'catalog') activePage = 0
@@ -665,7 +664,7 @@ self.onmessage = async ({ data }: MessageEvent<CatalogRequest>) => {
     database ??= openCatalog()
     const db = await database
     if (data.type === 'sync') {
-      await syncCatalog(db, data.force === true)
+      await syncCatalog(db)
       return
     }
     if (data.type === 'details') {

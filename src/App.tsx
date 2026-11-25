@@ -80,7 +80,7 @@ function CardLegalities({ details }: { details: PrintingDetails }) {
           </Fragment>
         ))}
       </dl> : <p>No legality data available.</p>}
-      {!details.legalitiesComplete && <p>Update Full Catalog to see all legality statuses.</p>}
+      {!details.legalitiesComplete && <p>Refresh Catalog to see all legality statuses.</p>}
     </>
   )
 }
@@ -557,10 +557,10 @@ function App() {
           <button type="submit" disabled={busy || Boolean(selection)}>Search</button>
         </form>
         <button type="button" disabled={busy || Boolean(syncStatus)} onClick={() => {
-          if (navigator.onLine) workerRef.current?.postMessage({ type: 'sync', force: true })
+          if (navigator.onLine) workerRef.current?.postMessage({ type: 'sync' })
           else setSyncError('Connect to the internet to check for catalog updates.')
         }}>
-          Update Full Catalog
+          Refresh Catalog
         </button>
       </nav>
       <main className="catalog-main">
@@ -722,7 +722,7 @@ function App() {
           )}
           {error && <p role="alert">{error}</p>}
           {view === 'binder' && !binderMetadataReady && !syncStatus &&
-            <p>Use Update Full Catalog to load card type, color, and mana cost data.</p>}
+            <p>Use Refresh Catalog to load card type, color, and mana cost data.</p>}
           <p role="status">
             {busy ? 'Loading…' : view === 'catalog'
               ? (resultsRange ? `Showing printings ${resultsRange}` : 'No matching printings.')
