@@ -39,6 +39,9 @@ let database: ReturnType<typeof openCatalog> | undefined
 let view: View = 'catalog'
 let filters = defaultFilters
 let catalogMatchCount: number | undefined
+const catalogPages = new Map<number, Record<string, unknown>[]>()
+const catalogPageCacheLimit = 8
+let catalogPage = 0
 let activePage = 0
 let customBinderPage = 0
 let binderFilters: BinderFilters | null = null
@@ -113,6 +116,8 @@ async function openCatalog() {
         id INTEGER PRIMARY KEY CHECK (id = 1),
         updated_at TEXT NOT NULL
       );
+      CREATE INDEX IF NOT EXISTS card_printings_name_order
+        ON card_printings (name COLLATE NOCASE, set_code, collector_number);
     `)
     const columns = catalog.selectObjects('PRAGMA table_info(card_printings)')
     for (const [name, type] of Object.entries({
@@ -251,9 +256,30 @@ const sortOrders = {
 const playableInCondition = `(EXISTS (SELECT 1 FROM json_each(legalities) WHERE key = ? AND value IN ('legal', 'restricted'))
   OR (legalities IS NULL AND EXISTS (SELECT 1 FROM json_each(allowed_formats) WHERE value = ?)))`
 
+function clearCatalogResults() {
+  catalogMatchCount = undefined
+  catalogPages.clear()
+}
+
 function catalogResults(catalog: Database, page: number) {
-  const conditions = ['(instr(lower(name), lower(?)) > 0 OR lower(scryfall_id) = lower(?))']
-  const values: (string | number)[] = [filters.query.trim(), filters.query.trim()]
+  // Cached pages belong to the current catalog snapshot and applied filters only.
+  const cachedRows = catalogPages.get(page)
+  if (cachedRows && catalogMatchCount !== undefined) {
+    return { rows: cachedRows, matchCount: catalogMatchCount, page }
+  }
+
+  const conditions: string[] = []
+  const values: (string | number)[] = []
+  const query = filters.query.trim()
+  if (query) {
+    if (/^[\da-f]{8}(?:-[\da-f]{4}){3}-[\da-f]{12}$/i.test(query)) {
+      conditions.push('scryfall_id = ?')
+      values.push(query.toLowerCase())
+    } else {
+      conditions.push('(instr(lower(name), lower(?)) > 0 OR lower(scryfall_id) = lower(?))')
+      values.push(query, query)
+    }
+  }
   if (filters.languages.length) {
     conditions.push(`language IN (${filters.languages.map(() => '?').join(', ')})`)
     values.push(...filters.languages)
@@ -268,7 +294,7 @@ function catalogResults(catalog: Database, page: number) {
   }
   if (filters.finish === 'foil' || filters.finish === 'nonfoil') conditions.push(`${filters.finish} = 1`)
 
-  const from = `FROM card_printings WHERE ${conditions.join(' AND ')}`
+  const from = conditions.length ? `FROM card_printings WHERE ${conditions.join(' AND ')}` : 'FROM card_printings'
   const matchCount = catalogMatchCount ??= Number(catalog.selectValue(`SELECT count(*) ${from}`, values))
   const lastPage = Math.max(0, Math.ceil(matchCount / binderSpreadSize) - 1)
   const currentPage = Math.min(page, lastPage)
@@ -277,6 +303,11 @@ function catalogResults(catalog: Database, page: number) {
      ORDER BY ${sortOrders[filters.sort] ?? sortOrders.name} LIMIT ? OFFSET ?`,
     [...values, binderSpreadSize, currentPage * binderSpreadSize],
   )
+  catalogPages.set(currentPage, rows)
+  if (catalogPages.size > catalogPageCacheLimit) {
+    const oldestPage = catalogPages.keys().next().value
+    if (oldestPage !== undefined) catalogPages.delete(oldestPage)
+  }
   return { rows, matchCount, page: currentPage }
 }
 
@@ -594,6 +625,7 @@ function publishResults(db: Awaited<ReturnType<typeof openCatalog>>, edited = fa
     rows = result.rows
     matchCount = result.matchCount
     activePage = result.page
+    catalogPage = result.page
   } else {
     let result = collectionRows(db, offset)
     if (binderFilters) {
@@ -655,9 +687,8 @@ async function syncCatalog(db: Awaited<ReturnType<typeof openCatalog>>) {
     if (!binderMetadataReady || !legalitiesReady || typeof localVersion !== 'string' || Date.parse(localVersion) < Date.parse(source.updated_at)) {
       self.postMessage({ type: 'sync', message: 'Downloading the Scryfall snapshot to check for card changes…' })
       await refreshCatalog(catalog, source)
-      catalogMatchCount = undefined
+      clearCatalogResults()
       refreshLanguages(catalog)
-      if (view === 'catalog') activePage = 0
       publishResults(db)
     }
     self.postMessage({ type: 'sync', message: '' })
@@ -760,10 +791,13 @@ self.onmessage = async ({ data }: MessageEvent<CatalogRequest>) => {
     if (data.type === 'view') {
       view = data.view
       binderFilters = null
+      activePage = view === 'catalog' ? catalogPage : 0
+      publishResults(db)
+      return
     }
     if (data.type === 'search') {
+      if (JSON.stringify(filters) !== JSON.stringify(data.filters)) clearCatalogResults()
       filters = data.filters
-      catalogMatchCount = undefined
     }
     if (data.type === 'page') activePage = data.page
     else if (data.type !== 'layout' || view === 'binder') activePage = 0
