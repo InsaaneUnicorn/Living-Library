@@ -55,7 +55,13 @@ let languages: string[] = []
 
 async function openCatalog() {
   const sqlite = await sqlite3InitModule()
-  const { OpfsSAHPoolDb } = await sqlite.installOpfsSAHPoolVfs({ initialCapacity: 6 })
+  // The installed SQLite version supports retrying even though its types omit the option.
+  const poolOptions = {
+    initialCapacity: 6,
+    preserveOnInitFailure: true,
+    forceReinitIfPreviouslyFailed: true,
+  }
+  const { OpfsSAHPoolDb } = await sqlite.installOpfsSAHPoolVfs(poolOptions)
   const collection = new OpfsSAHPoolDb('/collection.sqlite3')
   try {
     collection.exec(`
@@ -137,6 +143,17 @@ async function openCatalog() {
     collection.close()
     throw error
   }
+}
+
+function getDatabase() {
+  return database ??= openCatalog().catch((error: unknown) => {
+    database = undefined
+    if ((error instanceof DOMException || error instanceof Error) && (error.name === 'NoModificationAllowedError' ||
+      error.message.toLowerCase() === 'no modification allowed')) {
+      throw new Error('The local database is locked. Close other Living Library tabs or windows, then choose Retry Local Database.')
+    }
+    throw error
+  })
 }
 
 async function* streamCards(body: ReadableStream<BufferSource>) {
@@ -295,7 +312,9 @@ function catalogResults(catalog: Database, page: number) {
   if (filters.finish === 'foil' || filters.finish === 'nonfoil') conditions.push(`${filters.finish} = 1`)
 
   const from = conditions.length ? `FROM card_printings WHERE ${conditions.join(' AND ')}` : 'FROM card_printings'
-  const matchCount = catalogMatchCount ??= Number(catalog.selectValue(`SELECT count(*) ${from}`, values))
+  const matchCount = catalogMatchCount ??= Number(catalog.selectValue(
+    `SELECT count(*) ${from}`, values.length ? values : undefined,
+  ))
   const lastPage = Math.max(0, Math.ceil(matchCount / binderSpreadSize) - 1)
   const currentPage = Math.min(page, lastPage)
   const rows = catalog.selectObjects(
@@ -699,8 +718,7 @@ async function syncCatalog(db: Awaited<ReturnType<typeof openCatalog>>) {
 
 self.onmessage = async ({ data }: MessageEvent<CatalogRequest>) => {
   try {
-    database ??= openCatalog()
-    const db = await database
+    const db = await getDatabase()
     if (data.type === 'sync') {
       await syncCatalog(db)
       return

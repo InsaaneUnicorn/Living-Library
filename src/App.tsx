@@ -270,15 +270,15 @@ function App() {
   const [preview, setPreview] = useState<Preview | null>(null)
   const [binderId, setBinderId] = useState(readActiveBinder)
   const acknowledgedBinder = useRef(binderId)
-  const initialBinderId = useRef(binderId)
   const [binders, setBinders] = useState<SavedBinder[]>([])
   const activeBinder = binders.find((binder) => binder.id === binderId)
   const binderActionsDisabled = busy || !activeBinder
   const [binderNameForm, setBinderNameForm] = useState<'create' | 'rename' | null>(null)
   const [binderName, setBinderName] = useState('')
   const [preferences, setPreferences] = useState(() => readPreferences(binderId))
-  const initialPageSize = useRef(preferences.rows * preferences.columns)
-  const initialBinderSorting = useRef(preferences.binderSorting)
+  const initialLoad = useRef<Extract<CatalogRequest, { type: 'load' }>>({
+    type: 'load', binderId, pageSize: preferences.rows * preferences.columns, binderSorting: preferences.binderSorting,
+  })
   const [settingsOpen, setSettingsOpen] = useState(false)
   const [cover, setCover] = useState<'front' | 'back' | null>(null)
   const [lastSlot, setLastSlot] = useState(-1)
@@ -291,6 +291,7 @@ function App() {
 
   useEffect(() => {
     const worker = new Worker(new URL('./db.worker.ts', import.meta.url), { type: 'module' })
+    let databaseLoaded = false
     workerRef.current = worker
     worker.onmessage = ({ data }: MessageEvent<WorkerResponse>) => {
       if (data.type === 'results') {
@@ -325,6 +326,10 @@ function App() {
         setPage(data.page)
         setUpdatedAt(data.updatedAt)
         setBusy(false)
+        if (!databaseLoaded) {
+          databaseLoaded = true
+          checkForUpdates()
+        }
       } else if (data.type === 'binder-export') {
         try {
           downloadBinder(data.file, data.format)
@@ -360,12 +365,10 @@ function App() {
       setBusy(false)
       setSyncStatus('')
     }
-    worker.postMessage({ type: 'load', pageSize: initialPageSize.current,
-      binderSorting: initialBinderSorting.current, binderId: initialBinderId.current })
+    worker.postMessage(initialLoad.current)
     function checkForUpdates() {
-      if (navigator.onLine) worker.postMessage({ type: 'sync' })
+      if (databaseLoaded && navigator.onLine) worker.postMessage({ type: 'sync' })
     }
-    checkForUpdates()
     window.addEventListener('online', checkForUpdates)
     return () => {
       window.removeEventListener('online', checkForUpdates)
@@ -376,7 +379,7 @@ function App() {
 
   function requestPrintings(request: Exclude<CatalogRequest, { type: 'load' | 'sync' | 'details' }>) {
     const worker = workerRef.current
-    if (!worker || busy) return
+    if (!worker || busy || !activeBinder) return
     pendingTurn.current = request.type === 'page'
       ? { page: request.page, direction: request.page > page ? 'next' : 'previous', previousCards: cards }
       : null
@@ -575,9 +578,9 @@ function App() {
     <div className="library-app" data-site-theme={preferences.siteTheme}>
       <nav className="catalog-nav" aria-label="Catalog controls">
         <h1>Living Library</h1>
-        <button type="button" aria-pressed={view === 'catalog'} disabled={busy}
+        <button type="button" aria-pressed={view === 'catalog'} disabled={binderActionsDisabled}
           onClick={() => changeView('catalog')}>Show Card Catalog</button>
-        <button type="button" aria-pressed={view === 'binder'} disabled={busy}
+        <button type="button" aria-pressed={view === 'binder'} disabled={binderActionsDisabled}
           onClick={() => changeView('binder')}>Show Binder</button>
         <button type="button" disabled={busy} onClick={() => setSettingsOpen(true)}>Settings</button>
         <form id="card-search" role="search" onSubmit={(event) => {
@@ -591,13 +594,19 @@ function App() {
               if (view === 'catalog') setFilters({ ...filters, query })
               else setBinderFilterDraft({ ...binderFilterDraft, query })
             }} />
-          <button type="submit" disabled={busy || Boolean(selection)}>Search</button>
+          <button type="submit" disabled={binderActionsDisabled || Boolean(selection)}>Search</button>
         </form>
         <button type="button" disabled={busy || Boolean(syncStatus)} onClick={() => {
-          if (navigator.onLine) workerRef.current?.postMessage({ type: 'sync' })
+          const worker = workerRef.current
+          if (!worker) return
+          if (!activeBinder) {
+            setBusy(true)
+            setError('')
+            worker.postMessage(initialLoad.current)
+          } else if (navigator.onLine) worker.postMessage({ type: 'sync' })
           else setSyncError('Connect to the internet to check for catalog updates.')
         }}>
-          Refresh Catalog
+          {activeBinder || busy ? 'Refresh Catalog' : 'Retry Local Database'}
         </button>
       </nav>
       <main className="catalog-main">
@@ -772,14 +781,14 @@ function App() {
           {syncStatus && <p role="status">{syncStatus}</p>}
           {syncError && <p role="alert">Catalog update failed. {syncError}</p>}
           {updatedAt && <p>Catalog updated {new Date(updatedAt).toLocaleString()}</p>}
-          {view === 'catalog' && !busy && !updatedAt && !syncStatus && (
-            <p>Connect to the internet to download the full card catalog.</p>
+          {view === 'catalog' && activeBinder && !busy && !updatedAt && !syncStatus && !syncError && (
+            <p>No catalog has been downloaded to this browser yet.</p>
           )}
           {error && <p role="alert">{error}</p>}
           {view === 'binder' && !binderMetadataReady && !syncStatus &&
             <p>Use Refresh Catalog to load card type, color, and mana cost data.</p>}
           <p role="status">
-            {busy ? 'Loading…' : view === 'catalog'
+            {busy ? 'Loading…' : !activeBinder ? null : view === 'catalog'
               ? (resultsRange ? `Showing printings ${resultsRange}` : 'No matching printings.')
               : filteredBinder ? (resultsRange ? `Showing cards ${resultsRange}` : 'No matching binder cards.')
               : selectedCards ? 'Select cards on any binder page.' : 'Select a card to move it, or use Select Cards for multiple cards.'}
