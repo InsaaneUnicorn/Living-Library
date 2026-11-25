@@ -28,12 +28,13 @@ export type BinderFilters = {
   color: string
   manaCost: string
   sets: string
+  legalIn: string
   tag: string
   tagOrder: '' | 'asc' | 'desc' | 'priorities'
 }
 
 export const defaultBinderFilters: BinderFilters = {
-  query: '', typeLine: '', color: '', manaCost: '', sets: '', tag: '', tagOrder: '',
+  query: '', typeLine: '', color: '', manaCost: '', sets: '', legalIn: '', tag: '', tagOrder: '',
 }
 
 export const legalityFormatNames: Record<string, string> = {

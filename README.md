@@ -57,8 +57,9 @@ See [Chrome’s web app instructions for Android](https://support.google.com/chr
   it, then writes only new or changed printings and removes printings missing
   from the snapshot. Binders stay on the device and are not synced.
 - Open **Show Card Catalog**. Search by a partial card name or an exact Scryfall
-  ID. Filter by language, set, playable format, or finish, then click **Apply
-  Filters**. **Secret Lair Printings** narrows the list to Secret Lair sets.
+  ID. Open the **Filters** tab on the left to filter by language, set, playable
+  format, or finish, then click **Apply Filters**. **Secret Lair Printings**
+  narrows the list to Secret Lair sets.
 - Open a printing to see its artwork, collector number, finish options, owned
   copies, and format legalities. Use **Show other face** for double-faced cards.
 - Choose a finish, click **Add to Binder**, select the destination binder if
@@ -81,8 +82,9 @@ See [Chrome’s web app instructions for Android](https://support.google.com/chr
 
 - In **Show Binder**, the navbar searches the active binder by a partial card
   name or exact Scryfall ID.
-- Use **Apply Filters** to combine card type, mana color, mana cost or value,
-  set, and tag. For example, use `{2}{U}` for a printed mana cost or `3`
+- Open the **Filters** tab to combine card type, mana color, mana cost or value,
+  set, playable format, and tag. **Playable in** includes legal and restricted
+  cards for the selected format. Use `{2}{U}` for a printed mana cost or `3`
   for mana value. Separate multiple sets with commas.
 - Sort by tag or choose **Settings priorities** to use your own rules. Set
   their order under **Settings → Binder sorting**. Earlier rules take priority

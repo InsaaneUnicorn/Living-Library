@@ -247,6 +247,10 @@ const sortOrders = {
   set: 'set_name COLLATE NOCASE, set_code, CAST(collector_number AS INTEGER), collector_number, id',
 }
 
+// Older catalogs store playable formats as a list rather than statuses by format.
+const playableInCondition = `(EXISTS (SELECT 1 FROM json_each(legalities) WHERE key = ? AND value IN ('legal', 'restricted'))
+  OR (legalities IS NULL AND EXISTS (SELECT 1 FROM json_each(allowed_formats) WHERE value = ?)))`
+
 function catalogResults(catalog: Database, page: number) {
   const conditions = ['(instr(lower(name), lower(?)) > 0 OR lower(scryfall_id) = lower(?))']
   const values: (string | number)[] = [filters.query.trim(), filters.query.trim()]
@@ -259,8 +263,7 @@ function catalogResults(catalog: Database, page: number) {
     values.push(filters.set.trim(), filters.set.trim())
   }
   if (filters.legalIn) {
-    conditions.push(`(EXISTS (SELECT 1 FROM json_each(legalities) WHERE key = ? AND value IN ('legal', 'restricted'))
-      OR (legalities IS NULL AND EXISTS (SELECT 1 FROM json_each(allowed_formats) WHERE value = ?)))`)
+    conditions.push(playableInCondition)
     values.push(filters.legalIn, filters.legalIn)
   }
   if (filters.finish === 'foil' || filters.finish === 'nonfoil') conditions.push(`${filters.finish} = 1`)
@@ -301,7 +304,7 @@ function collectionRows({ catalog, collection }: Awaited<ReturnType<typeof openC
     values,
   )
   const metadataFilters = binderFilters && (binderFilters.typeLine || binderFilters.color ||
-    binderFilters.manaCost || binderFilters.sets)
+    binderFilters.manaCost || binderFilters.sets || binderFilters.legalIn)
   const query = binderFilters?.query.toLowerCase()
   const filterByPrinting = metadataFilters || query
   const printings = binderFilters && (filterByPrinting || customSort)
@@ -376,6 +379,10 @@ function matchingPrintings(catalog: Database, filters: BinderFilters, ids: unkno
   if (filters.typeLine) {
     conditions.push('instr(lower(type_line), lower(?)) > 0')
     values.push(filters.typeLine)
+  }
+  if (filters.legalIn) {
+    conditions.push(playableInCondition)
+    values.push(filters.legalIn, filters.legalIn)
   }
   if (filters.color === 'colorless') {
     conditions.push('json_array_length(colors) = 0')

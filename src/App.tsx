@@ -1,4 +1,5 @@
 import { Fragment, useEffect, useRef, useState } from 'react'
+import type { ReactNode, RefObject } from 'react'
 import { binderColumns, binderPageSize, binderPagesPerSpread, binderRows, binderSpreadSize, defaultBinderFilters, defaultFilters, legalityFormatNames } from './binder'
 import type { BinderFilters, CatalogFilters, CatalogRequest, OwnedFinish, PrintingDetails, SavedBinder, SelectionTarget, View } from './binder'
 import { BinderCover, Settings } from './Settings'
@@ -58,6 +59,39 @@ function cardImages(card: Printing, fullSize = false): string[] {
 const finishLabels: Record<OwnedFinish, string> = { nonfoil: 'Nonfoil', foil: 'Foil', unspecified: 'Unspecified' }
 const legalityLabels: Record<string, string> = {
   legal: 'Legal', restricted: 'Restricted', banned: 'Banned', not_legal: 'Not legal',
+}
+
+function SideDrawer({ id, title, drawerRef, children }: {
+  id: string
+  title: string
+  drawerRef: RefObject<HTMLDialogElement | null>
+  children: ReactNode
+}) {
+  return <>
+    <button className="drawer-tab" type="button" aria-haspopup="dialog" aria-controls={id}
+      onClick={() => drawerRef.current?.showModal()}>
+      {title} <span aria-hidden="true">›</span>
+    </button>
+    <dialog id={id} className="side-drawer" ref={drawerRef} aria-labelledby={`${id}-title`}
+      onClick={(event) => {
+        if (event.target === event.currentTarget) event.currentTarget.close()
+      }}>
+      <header>
+        <h2 id={`${id}-title`}>{title}</h2>
+        <button type="button" className="drawer-close" aria-label={`Close ${title}`} autoFocus
+          onClick={() => drawerRef.current?.close()}>×</button>
+      </header>
+      {children}
+    </dialog>
+  </>
+}
+
+function PlayableInFilter({ value, onChange }: { value: string; onChange: (format: string) => void }) {
+  return <label>Playable in <select value={value} onChange={(event) => onChange(event.target.value)}>
+    <option value="">Any format</option>
+    {Object.entries(legalityFormatNames).map(([format, name]) =>
+      <option key={format} value={format}>{name}</option>)}
+  </select></label>
 }
 
 function CardLegalities({ details }: { details: PrintingDetails }) {
@@ -212,6 +246,8 @@ function downloadBinder(file: BinderFile, format: BinderFileFormat) {
 
 function App() {
   const workerRef = useRef<Worker | null>(null)
+  const binderDrawer = useRef<HTMLDialogElement>(null)
+  const filterDrawer = useRef<HTMLDialogElement>(null)
   const importInput = useRef<HTMLInputElement>(null)
   const pendingImport = useRef<string | null>(null)
   const pendingTurn = useRef<(PageTurn & { page: number }) | null>(null)
@@ -450,6 +486,7 @@ function App() {
       color: filters.color,
       manaCost: filters.manaCost.trim(),
       sets: filters.sets.split(',').map((set) => set.trim()).filter(Boolean).join(','),
+      legalIn: filters.legalIn,
       tag: filters.tag,
       tagOrder: filters.tagOrder,
     } })
@@ -564,155 +601,173 @@ function App() {
         </button>
       </nav>
       <main className="catalog-main">
-        <section className="catalog-filters binder-manager" aria-labelledby="binders-heading">
-          <h2 id="binders-heading">My Binders</h2>
-          <label>Active binder <select aria-label="Binder" value={activeBinder ? binderId : ''}
-            disabled={binderActionsDisabled} onChange={(event) => {
-            const id = event.target.value
-            const { rows, columns, binderSorting } = readPreferences(id)
-            setBinderNameForm(null)
-            openBinder({ type: 'switch-binder', binderId: id, pageSize: rows * columns, binderSorting })
-          }}>
-            {!activeBinder && <option value="">{workerBusy ? 'Loading binders…' : 'Binders unavailable'}</option>}
-            {binders.map(({ id, name }) => <option value={id} key={id}>{name}</option>)}
-          </select></label>
-          <button type="button" disabled={binderActionsDisabled} onClick={() => {
-            setBinderName('')
-            setBinderNameForm('create')
-          }}>New Binder</button>
-          <button type="button" disabled={binderActionsDisabled} onClick={() => {
-            setBinderName(activeBinder?.name ?? '')
-            setBinderNameForm('rename')
-          }}>Rename Binder</button>
-          {(['json', 'csv'] as const).map((format) => (
-            <button key={format} type="button" disabled={binderActionsDisabled} onClick={() => {
-              setTransferStatus('')
-              requestPrintings({ type: 'export-binder', binderId, format, preferences })
-            }}>Export {format.toUpperCase()}</button>
-          ))}
-          <button type="button" disabled={binderActionsDisabled} onClick={() => importInput.current?.click()}>Import Binder</button>
-          <input ref={importInput} type="file" accept=".json,.csv,application/json,text/csv" hidden
-            onChange={(event) => {
-              const file = event.currentTarget.files?.[0]
-              event.currentTarget.value = ''
-              void importBinderFile(file)
-            }} />
-          {transferStatus && <p role="status">{transferStatus}</p>}
-          {binderNameForm && <form className="catalog-filters binder-name-form" onSubmit={(event) => {
+        <SideDrawer id="binder-drawer" title="My Binders" drawerRef={binderDrawer}>
+          <div className="catalog-filters binder-manager">
+            <label>Active binder <select aria-label="Binder" value={activeBinder ? binderId : ''}
+              disabled={binderActionsDisabled} onChange={(event) => {
+              const id = event.target.value
+              const { rows, columns, binderSorting } = readPreferences(id)
+              setBinderNameForm(null)
+              openBinder({ type: 'switch-binder', binderId: id, pageSize: rows * columns, binderSorting })
+              binderDrawer.current?.close()
+            }}>
+              {!activeBinder && <option value="">{workerBusy ? 'Loading binders…' : 'Binders unavailable'}</option>}
+              {binders.map(({ id, name }) => <option value={id} key={id}>{name}</option>)}
+            </select></label>
+            <button type="button" disabled={binderActionsDisabled} onClick={() => {
+              setBinderName('')
+              setBinderNameForm('create')
+            }}>New Binder</button>
+            <button type="button" disabled={binderActionsDisabled} onClick={() => {
+              setBinderName(activeBinder?.name ?? '')
+              setBinderNameForm('rename')
+            }}>Rename Binder</button>
+            {(['json', 'csv'] as const).map((format) => (
+              <button key={format} type="button" disabled={binderActionsDisabled} onClick={() => {
+                setTransferStatus('')
+                requestPrintings({ type: 'export-binder', binderId, format, preferences })
+              }}>Export {format.toUpperCase()}</button>
+            ))}
+            <button type="button" disabled={binderActionsDisabled} onClick={() => importInput.current?.click()}>Import Binder</button>
+            <input ref={importInput} type="file" accept=".json,.csv,application/json,text/csv" hidden
+              onChange={(event) => {
+                const file = event.currentTarget.files?.[0]
+                event.currentTarget.value = ''
+                void importBinderFile(file)
+              }} />
+            {transferStatus && <p role="status">{transferStatus}</p>}
+            {error && <p role="alert">{error}</p>}
+            {binderNameForm && <form className="catalog-filters binder-name-form" onSubmit={(event) => {
+              event.preventDefault()
+              const name = binderName.trim()
+              if (busy || !name) return
+              if (binderNameForm === 'create') {
+                const { rows, columns, binderSorting } = defaultPreferences
+                openBinder({ type: 'create-binder', name, pageSize: rows * columns, binderSorting })
+                binderDrawer.current?.close()
+              } else {
+                requestPrintings({ type: 'rename-binder', name })
+              }
+              setBinderNameForm(null)
+            }}>
+              <label>Binder name <input autoFocus value={binderName} required maxLength={60}
+                onChange={(event) => setBinderName(event.target.value)} /></label>
+              <button type="submit" disabled={busy || !binderName.trim()}>
+                {binderNameForm === 'create' ? 'Create Binder' : 'Save Name'}
+              </button>
+              <button type="button" onClick={() => setBinderNameForm(null)}>Cancel</button>
+            </form>}
+          </div>
+        </SideDrawer>
+        <SideDrawer id="filter-drawer" title="Filters" drawerRef={filterDrawer}>
+          {view === 'catalog' && <form className="catalog-filters" aria-label="Catalog filters" onSubmit={(event) => {
             event.preventDefault()
-            const name = binderName.trim()
-            if (busy || !name) return
-            if (binderNameForm === 'create') {
-              const { rows, columns, binderSorting } = defaultPreferences
-              openBinder({ type: 'create-binder', name, pageSize: rows * columns, binderSorting })
-            } else {
-              requestPrintings({ type: 'rename-binder', name })
-            }
-            setBinderNameForm(null)
+            if (busy) return
+            requestPrintings({ type: 'search', filters })
+            filterDrawer.current?.close()
           }}>
-            <label>Binder name <input autoFocus value={binderName} required maxLength={60}
-              onChange={(event) => setBinderName(event.target.value)} /></label>
-            <button type="submit" disabled={busy || !binderName.trim()}>
-              {binderNameForm === 'create' ? 'Create Binder' : 'Save Name'}
-            </button>
-            <button type="button" onClick={() => setBinderNameForm(null)}>Cancel</button>
-          </form>}
-        </section>
-        {view === 'catalog' && <div className="catalog-filters" aria-label="Catalog filters" role="group">
-          <details className="language-filter">
-            <summary>Languages{filters.languages.length ? ` (${filters.languages.length})` : ''}</summary>
-            <div className="language-options">
-              {languages.map((language) => (
-                <label key={language}>
-                  <input type="checkbox" checked={filters.languages.includes(language)} onChange={(event) => {
-                    const selected = event.target.checked
-                    setFilters((current) => ({ ...current, languages: selected
-                      ? [...current.languages, language]
-                      : current.languages.filter((item) => item !== language) }))
-                  }} />
-                  {languageLabels[language] ?? languageNames.of(language) ?? language}
-                </label>
-              ))}
-              {!languages.length && <span>Languages appear after the catalog loads.</span>}
+            <details className="language-filter">
+              <summary>Languages{filters.languages.length ? ` (${filters.languages.length})` : ''}</summary>
+              <div className="language-options">
+                {languages.map((language) => (
+                  <label key={language}>
+                    <input type="checkbox" checked={filters.languages.includes(language)} onChange={(event) => {
+                      const selected = event.target.checked
+                      setFilters((current) => ({ ...current, languages: selected
+                        ? [...current.languages, language]
+                        : current.languages.filter((item) => item !== language) }))
+                    }} />
+                    {languageLabels[language] ?? languageNames.of(language) ?? language}
+                  </label>
+                ))}
+                {!languages.length && <span>Languages appear after the catalog loads.</span>}
+              </div>
+            </details>
+            <label>Set <input placeholder="Name or code" value={filters.set}
+              onChange={(event) => setFilters({ ...filters, set: event.target.value })} /></label>
+            <button type="button" disabled={busy} onClick={() => {
+              const next = { ...filters, set: 'Secret Lair' }
+              setFilters(next)
+              requestPrintings({ type: 'search', filters: next })
+              filterDrawer.current?.close()
+            }}>Secret Lair Printings</button>
+            <PlayableInFilter value={filters.legalIn}
+              onChange={(legalIn) => setFilters({ ...filters, legalIn })} />
+            <label>Finish <select value={filters.finish} onChange={(event) => {
+              setFilters({ ...filters, finish: event.target.value as CatalogFilters['finish'] })
+            }}>
+              <option value="">Any finish</option>
+              <option value="foil">Foil available</option>
+              <option value="nonfoil">Nonfoil available</option>
+            </select></label>
+            <label>Sort by <select value={filters.sort} onChange={(event) => {
+              setFilters({ ...filters, sort: event.target.value as CatalogFilters['sort'] })
+            }}>
+              <option value="name">Name (A–Z)</option>
+              <option value="name-desc">Name (Z–A)</option>
+              <option value="set">Set and collector number</option>
+            </select></label>
+            <div className="filter-actions">
+              <button type="submit" disabled={busy}>Apply Filters</button>
+              <button type="button" disabled={busy} onClick={() => {
+                setFilters(defaultFilters)
+                requestPrintings({ type: 'search', filters: defaultFilters })
+                filterDrawer.current?.close()
+              }}>Clear</button>
             </div>
-          </details>
-          <label>Set <input form="card-search" placeholder="Name or code" value={filters.set}
-            onChange={(event) => setFilters({ ...filters, set: event.target.value })} /></label>
-          <button type="button" disabled={busy} onClick={() => {
-            const next = { ...filters, set: 'Secret Lair' }
-            setFilters(next)
-            requestPrintings({ type: 'search', filters: next })
-          }}>Secret Lair Printings</button>
-          <label>Playable in <select value={filters.legalIn}
-            onChange={(event) => setFilters({ ...filters, legalIn: event.target.value })}>
-            <option value="">Any format</option>
-            {Object.entries(legalityFormatNames).map(([format, name]) =>
-              <option key={format} value={format}>{name}</option>)}
-          </select></label>
-          <label>Finish <select value={filters.finish} onChange={(event) => {
-            setFilters({ ...filters, finish: event.target.value as CatalogFilters['finish'] })
+          </form>}
+          {view === 'binder' && <form className="catalog-filters" aria-label="Binder filters" onSubmit={(event) => {
+            event.preventDefault()
+            if (busy || selection) return
+            applyBinderFilters(binderFilterDraft)
+            filterDrawer.current?.close()
           }}>
-            <option value="">Any finish</option>
-            <option value="foil">Foil available</option>
-            <option value="nonfoil">Nonfoil available</option>
-          </select></label>
-          <label>Sort by <select value={filters.sort} onChange={(event) => {
-            setFilters({ ...filters, sort: event.target.value as CatalogFilters['sort'] })
-          }}>
-            <option value="name">Name (A–Z)</option>
-            <option value="name-desc">Name (Z–A)</option>
-            <option value="set">Set and collector number</option>
-          </select></label>
-          <button type="submit" form="card-search" disabled={busy}>Apply Filters</button>
-          <button type="button" disabled={busy} onClick={() => {
-            setFilters(defaultFilters)
-            requestPrintings({ type: 'search', filters: defaultFilters })
-          }}>Clear</button>
-        </div>}
-        {view === 'binder' && <form className="catalog-filters" aria-label="Binder filters" onSubmit={(event) => {
-          event.preventDefault()
-          applyBinderFilters(binderFilterDraft)
-        }}>
-          <label>Card type <input placeholder="e.g. Creature" value={binderFilterDraft.typeLine}
-            onChange={(event) => setBinderFilterDraft({ ...binderFilterDraft, typeLine: event.target.value })} /></label>
-          <label>Mana color <select value={binderFilterDraft.color}
-            onChange={(event) => setBinderFilterDraft({ ...binderFilterDraft, color: event.target.value })}>
-            <option value="">Any color</option>
-            <option value="W">White</option>
-            <option value="U">Blue</option>
-            <option value="B">Black</option>
-            <option value="R">Red</option>
-            <option value="G">Green</option>
-            <option value="colorless">Colorless</option>
-          </select></label>
-          <label>Mana cost <input placeholder="e.g. {2}{U} or 3" value={binderFilterDraft.manaCost}
-            onChange={(event) => setBinderFilterDraft({ ...binderFilterDraft, manaCost: event.target.value })} /></label>
-          <label>Sets <input placeholder="Names or codes" maxLength={250} value={binderFilterDraft.sets}
-            aria-describedby="binder-set-hint"
-            onChange={(event) => setBinderFilterDraft({ ...binderFilterDraft, sets: event.target.value })} /></label>
-          <span id="binder-set-hint">Separate sets with commas.</span>
-          <label>Tag <select value={binderFilterDraft.tag}
-            onChange={(event) => setBinderFilterDraft({ ...binderFilterDraft, tag: event.target.value })}>
-            <option value="">Any tag</option>
-            {binderFilterDraft.tag && !binderTags.includes(binderFilterDraft.tag) &&
-              <option value={binderFilterDraft.tag}>{binderFilterDraft.tag}</option>}
-            {binderTags.map((tag) => <option key={tag} value={tag}>{tag}</option>)}
-          </select></label>
-          <label>Sort by <select value={binderFilterDraft.tagOrder} onChange={(event) => {
-            const tagOrder = event.target.value as BinderFilters['tagOrder']
-            setBinderFilterDraft({ ...binderFilterDraft, tagOrder })
-          }}>
-            <option value="">Pocket order</option>
-            <option value="asc">Tag (A–Z)</option>
-            <option value="desc">Tag (Z–A)</option>
-            <option value="priorities">Settings priorities</option>
-          </select></label>
-          <button type="submit" disabled={busy || Boolean(selection)}>Apply Filters</button>
-          <button type="button" disabled={busy || Boolean(selection)} onClick={() => {
-            setBinderFilterDraft(defaultBinderFilters)
-            applyBinderFilters(defaultBinderFilters)
-          }}>Custom Layout</button>
-        </form>}
+            <label>Card type <input placeholder="e.g. Creature" value={binderFilterDraft.typeLine}
+              onChange={(event) => setBinderFilterDraft({ ...binderFilterDraft, typeLine: event.target.value })} /></label>
+            <label>Mana color <select value={binderFilterDraft.color}
+              onChange={(event) => setBinderFilterDraft({ ...binderFilterDraft, color: event.target.value })}>
+              <option value="">Any color</option>
+              <option value="W">White</option>
+              <option value="U">Blue</option>
+              <option value="B">Black</option>
+              <option value="R">Red</option>
+              <option value="G">Green</option>
+              <option value="colorless">Colorless</option>
+            </select></label>
+            <label>Mana cost <input placeholder="e.g. {2}{U} or 3" value={binderFilterDraft.manaCost}
+              onChange={(event) => setBinderFilterDraft({ ...binderFilterDraft, manaCost: event.target.value })} /></label>
+            <label>Sets <input placeholder="Names or codes" maxLength={250} value={binderFilterDraft.sets}
+              aria-describedby="binder-set-hint"
+              onChange={(event) => setBinderFilterDraft({ ...binderFilterDraft, sets: event.target.value })} /></label>
+            <span id="binder-set-hint">Separate sets with commas.</span>
+            <PlayableInFilter value={binderFilterDraft.legalIn}
+              onChange={(legalIn) => setBinderFilterDraft({ ...binderFilterDraft, legalIn })} />
+            <label>Tag <select value={binderFilterDraft.tag}
+              onChange={(event) => setBinderFilterDraft({ ...binderFilterDraft, tag: event.target.value })}>
+              <option value="">Any tag</option>
+              {binderFilterDraft.tag && !binderTags.includes(binderFilterDraft.tag) &&
+                <option value={binderFilterDraft.tag}>{binderFilterDraft.tag}</option>}
+              {binderTags.map((tag) => <option key={tag} value={tag}>{tag}</option>)}
+            </select></label>
+            <label>Sort by <select value={binderFilterDraft.tagOrder} onChange={(event) => {
+              const tagOrder = event.target.value as BinderFilters['tagOrder']
+              setBinderFilterDraft({ ...binderFilterDraft, tagOrder })
+            }}>
+              <option value="">Pocket order</option>
+              <option value="asc">Tag (A–Z)</option>
+              <option value="desc">Tag (Z–A)</option>
+              <option value="priorities">Settings priorities</option>
+            </select></label>
+            <div className="filter-actions">
+              <button type="submit" disabled={busy || Boolean(selection)}>Apply Filters</button>
+              <button type="button" disabled={busy || Boolean(selection)} onClick={() => {
+                setBinderFilterDraft(defaultBinderFilters)
+                applyBinderFilters(defaultBinderFilters)
+                filterDrawer.current?.close()
+              }}>Custom Layout</button>
+            </div>
+          </form>}
+        </SideDrawer>
         <div className="catalog-status">
           {syncStatus && <p role="status">{syncStatus}</p>}
           {syncError && <p role="alert">Catalog update failed. {syncError}</p>}
