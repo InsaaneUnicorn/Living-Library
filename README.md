@@ -40,7 +40,7 @@ See [Apple’s web app installation instructions](https://support.apple.com/en-a
 
 ### Android
 
-1. Open your hosted Living Library [**HTTPS** address](https://insaaneunicorn.github.io/LivingLibrary) in an up-to-date Chrome browser.
+1. Open your hosted Living Library [**HTTPS** address](https://insaaneunicorn.github.io/Living-Library) in an up-to-date Chrome browser.
 2. Tap **⋮ → Install and create shortcut → Install** when offered. Some Chrome
    versions list this under **Add to Home screen**.
 3. Open Living Library from the Home screen or app drawer. You can also use it
